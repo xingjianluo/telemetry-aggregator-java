@@ -1,0 +1,169 @@
+package com.github.xingjianluo.telemetryaggregatorjava.alert;
+
+import com.github.xingjianluo.telemetryaggregatorjava.model.WindowAggregate;
+import com.github.xingjianluo.telemetryaggregatorjava.trace.TraceStatus;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * 告警评估引擎。
+ *
+ * <p>稳定性规则（抑制阈值附近抖动）：
+ * <ul>
+ *   <li>每个“规则 × 评估对象（标签序列或 traceId）”维护独立状态机；</li>
+ *   <li>状态 OK：连续 {@code breachStreak} 个窗口超阈值才进入 FIRING（中间任一窗口
+ *       未超阈值则计数清零），不会因单点毛刺立刻报警；</li>
+ *   <li>状态 FIRING：连续 {@code recoverStreak} 个窗口未超阈值才回到 OK；</li>
+ *   <li>PENDING 表示已观察到越界但确认次数不足，对外可见但不算报警；</li>
+ *   <li>FIRING/恢复翻转还受 {@code cooldown} 冷却限制；冷却期内维持原状态；</li>
+ *   <li>只有窗口定稿（关闭）才驱动评估，避免在线部分数据反复改写结论。</li>
+ * </ul>
+ *
+ * <p>调用链作用域：链路被标记为 ORPHAN/CYCLE/DUPLICATE_SPAN 时不中止判定，
+ * 继续按当前数据评估并在快照中携带 traceMarker，保证结论可解释。
+ */
+public class AlertEngine {
+
+    private static final class Subject {
+        AlertState state = AlertState.OK;
+        int consecutiveBreaches;
+        int consecutiveRecoveries;
+        double lastValue = Double.NaN;
+        long lastWindowStart = -1L;
+        long lastChangedMillis = -1L;
+        Map<String, String> tags = Map.of();
+        String traceMarker;
+        AlertRule.Scope scope = AlertRule.Scope.TAGS;
+    }
+
+    private record SubjectKey(String ruleId, String subject) {
+    }
+
+    private final List<AlertRule> rules;
+    private final int breachStreak;
+    private final int recoverStreak;
+    private final long cooldownMillis;
+
+    private final Map<SubjectKey, Subject> subjects = new ConcurrentHashMap<>();
+
+    public AlertEngine(List<AlertRule> rules, int breachStreak, int recoverStreak, long cooldownMillis) {
+        this.rules = List.copyOf(rules);
+        this.breachStreak = Math.max(1, breachStreak);
+        this.recoverStreak = Math.max(1, recoverStreak);
+        this.cooldownMillis = Math.max(0, cooldownMillis);
+    }
+
+    /** 标签作用域：每个关闭窗口的聚合按匹配的规则评估。 */
+    public void onWindowSealed(WindowAggregate aggregate) {
+        for (AlertRule rule : rules) {
+            if (rule.scope() != AlertRule.Scope.TAGS) {
+                continue;
+            }
+            if (!matches(rule, aggregate)) {
+                continue;
+            }
+            String key = com.github.xingjianluo.telemetryaggregatorjava.window.WindowStore
+                    .tagsSignature(aggregate.tags());
+            Subject subject = subjects.computeIfAbsent(new SubjectKey(rule.id(), key), k -> new Subject());
+            subject.scope = AlertRule.Scope.TAGS;
+            subject.tags = aggregate.tags();
+            evaluate(rule, subject, aggregate.avg(), aggregate.windowStartMillis(), null);
+        }
+    }
+
+    /** 调用链作用域：由摄取管道按 trace 聚合的窗口结果驱动。 */
+    public void onTraceWindowSealed(String traceId, String service, String metric,
+                                    double avg, long count, long windowStartMillis,
+                                    TraceStatus traceStatus, List<String> traceReasons, long nowMillis) {
+        for (AlertRule rule : rules) {
+            if (rule.scope() != AlertRule.Scope.TRACE) {
+                continue;
+            }
+            if (rule.service() != null && !rule.service().isBlank() && !rule.service().equals(service)) {
+                continue;
+            }
+            if (rule.metric() != null && !rule.metric().isBlank() && !rule.metric().equals(metric)) {
+                continue;
+            }
+            Subject subject = subjects.computeIfAbsent(new SubjectKey(rule.id(), traceId), k -> new Subject());
+            subject.scope = AlertRule.Scope.TRACE;
+            String marker = traceStatus == TraceStatus.COMPLETE ? null
+                    : traceStatus + (traceReasons.isEmpty() ? "" : ": " + traceReasons);
+            evaluate(rule, subject, avg, windowStartMillis, marker);
+        }
+    }
+
+    private boolean matches(AlertRule rule, WindowAggregate aggregate) {
+        if (rule.service() != null && !rule.service().isBlank() && !rule.service().equals(aggregate.service())) {
+            return false;
+        }
+        if (rule.metric() != null && !rule.metric().isBlank() && !rule.metric().equals(aggregate.metric())) {
+            return false;
+        }
+        for (Map.Entry<String, String> sel : rule.tagSelector().entrySet()) {
+            String actual = aggregate.tags().get(sel.getKey());
+            if (!sel.getValue().equals(actual)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private synchronized void evaluate(AlertRule rule, Subject subject, double value,
+                                       long windowStartMillis, String traceMarker) {
+        subject.lastValue = value;
+        subject.lastWindowStart = windowStartMillis;
+        if (traceMarker != null) {
+            subject.traceMarker = traceMarker;
+        }
+        boolean breach = rule.breaches(value);
+        long now = System.currentTimeMillis();
+
+        if (subject.state == AlertState.FIRING) {
+            if (breach) {
+                subject.consecutiveBreaches++;
+                subject.consecutiveRecoveries = 0;
+            } else {
+                subject.consecutiveRecoveries++;
+                subject.consecutiveBreaches = 0;
+                if (subject.consecutiveRecoveries >= recoverStreak
+                        && now - subject.lastChangedMillis >= cooldownMillis) {
+                    subject.state = AlertState.OK;
+                    subject.lastChangedMillis = now;
+                }
+            }
+            return;
+        }
+
+        // OK / PENDING
+        if (breach) {
+            subject.consecutiveBreaches++;
+            subject.consecutiveRecoveries = 0;
+            if (subject.consecutiveBreaches < breachStreak) {
+                subject.state = AlertState.PENDING;
+            } else if (subject.lastChangedMillis < 0
+                    || now - subject.lastChangedMillis >= cooldownMillis) {
+                subject.state = AlertState.FIRING;
+                subject.lastChangedMillis = now;
+            }
+        } else {
+            subject.consecutiveBreaches = 0;
+            subject.consecutiveRecoveries = 0;
+            subject.state = AlertState.OK;
+        }
+    }
+
+    public synchronized List<AlertSnapshot> snapshots() {
+        List<AlertSnapshot> out = new ArrayList<>();
+        subjects.forEach((key, s) ->
+                out.add(new AlertSnapshot(
+                        key.ruleId(), s.scope, key.subject(),
+                        Map.copyOf(s.tags), s.state, s.consecutiveBreaches,
+                        s.consecutiveRecoveries, s.lastValue, s.lastWindowStart,
+                        s.lastChangedMillis, s.traceMarker)));
+        return out;
+    }
+}
