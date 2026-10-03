@@ -15,12 +15,14 @@ public class TelemetryProperties {
     private final Cardinality cardinality = new Cardinality();
     private final Trace trace = new Trace();
     private final Alert alert = new Alert();
+    private final Replay replay = new Replay();
 
     public Window getWindow() { return window; }
     public Buffer getBuffer() { return buffer; }
     public Cardinality getCardinality() { return cardinality; }
     public Trace getTrace() { return trace; }
     public Alert getAlert() { return alert; }
+    public Replay getReplay() { return replay; }
 
     /** 窗口与水位线参数。 */
     public static class Window {
@@ -125,5 +127,30 @@ public class TelemetryProperties {
         public void setRecoverStreak(int recoverStreak) { this.recoverStreak = recoverStreak; }
         public Duration getCooldown() { return cooldown; }
         public void setCooldown(Duration cooldown) { this.cooldown = cooldown; }
+    }
+
+    /** 在线复盘与规则运营的容量 / 资源边界参数。 */
+    public static class Replay {
+        /** 复盘日志保留的已接受事件数上限（环形，超龄丢弃并推进不可复盘下界）。 */
+        private int maxJournalEvents = 200_000;
+        /** 保留的告警判定事实条数上限（每规则×对象环形保留最近事实）。 */
+        private int maxAlertFacts = 200_000;
+        /** 单次复盘最多扫描的事件数；超过返回 RESOURCE_LIMITED。 */
+        private int maxScanEventsPerReplay = 200_000;
+        /** 同时执行的复盘数上限；超过快速返回 RESOURCE_LIMITED，不拖慢摄取。 */
+        private int maxConcurrentReplays = 1;
+        /** 复盘结果中最多返回的调用链条数。 */
+        private int maxTracesPerReport = 200;
+
+        public int getMaxJournalEvents() { return maxJournalEvents; }
+        public void setMaxJournalEvents(int maxJournalEvents) { this.maxJournalEvents = maxJournalEvents; }
+        public int getMaxAlertFacts() { return maxAlertFacts; }
+        public void setMaxAlertFacts(int maxAlertFacts) { this.maxAlertFacts = maxAlertFacts; }
+        public int getMaxScanEventsPerReplay() { return maxScanEventsPerReplay; }
+        public void setMaxScanEventsPerReplay(int maxScanEventsPerReplay) { this.maxScanEventsPerReplay = maxScanEventsPerReplay; }
+        public int getMaxConcurrentReplays() { return maxConcurrentReplays; }
+        public void setMaxConcurrentReplays(int maxConcurrentReplays) { this.maxConcurrentReplays = maxConcurrentReplays; }
+        public int getMaxTracesPerReport() { return maxTracesPerReport; }
+        public void setMaxTracesPerReport(int maxTracesPerReport) { this.maxTracesPerReport = maxTracesPerReport; }
     }
 }

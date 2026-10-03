@@ -6,6 +6,11 @@ import com.github.xingjianluo.telemetryaggregatorjava.dedup.EventDeduper;
 import com.github.xingjianluo.telemetryaggregatorjava.ingest.IngestionEngine;
 import com.github.xingjianluo.telemetryaggregatorjava.ingest.IngestionMetrics;
 import com.github.xingjianluo.telemetryaggregatorjava.query.QueryService;
+import com.github.xingjianluo.telemetryaggregatorjava.replay.EventJournal;
+import com.github.xingjianluo.telemetryaggregatorjava.replay.ReplayService;
+import com.github.xingjianluo.telemetryaggregatorjava.rule.RuleManager;
+import com.github.xingjianluo.telemetryaggregatorjava.rule.RuleVersion;
+import com.github.xingjianluo.telemetryaggregatorjava.rule.RuleVersionStore;
 import com.github.xingjianluo.telemetryaggregatorjava.trace.TraceRegistry;
 import com.github.xingjianluo.telemetryaggregatorjava.window.WatermarkGenerator;
 import com.github.xingjianluo.telemetryaggregatorjava.window.WindowStore;
@@ -56,15 +61,39 @@ public class TelemetryBeans {
     }
 
     @Bean
-    public AlertEngine alertEngine(TelemetryProperties props,
-                                   @Value("${telemetry.alert.rules:}") String rulesSpec) {
+    public EventJournal eventJournal(TelemetryProperties props) {
+        return new EventJournal(props.getReplay().getMaxJournalEvents(),
+                props.getReplay().getMaxAlertFacts());
+    }
+
+    @Bean
+    public RuleVersionStore ruleVersionStore(@Value("${telemetry.alert.rules:}") String rulesSpec) {
         List<AlertRule> rules = parseRules(rulesSpec);
         if (rules.isEmpty()) {
-            // 开箱即用的默认规则：任意 service/metric 的窗口均值 > 100 即进入告警判定。
             rules = List.of(new AlertRule("default-avg-gt-100", AlertRule.Scope.TAGS,
                     null, null, Map.of(), 100.0, AlertRule.Operator.GT));
         }
-        return new AlertEngine(rules,
+        RuleVersionStore store = new RuleVersionStore();
+        List<RuleVersion> seeded = new ArrayList<>();
+        long now = System.currentTimeMillis();
+        for (AlertRule r : rules) {
+            seeded.add(new RuleVersion(0, r.id(), true, r.scope(), r.service(), r.metric(),
+                    r.tagSelector(), r.threshold(), r.operator(),
+                    -1L, -1L, Long.MIN_VALUE, now, "启动配置"));
+        }
+        store.seed(seeded);
+        return store;
+    }
+
+    @Bean
+    public RuleManager ruleManager() {
+        return new RuleManager();
+    }
+
+    @Bean
+    public AlertEngine alertEngine(TelemetryProperties props,
+                                   RuleVersionStore ruleStore, EventJournal journal) {
+        return new AlertEngine(ruleStore, journal,
                 props.getAlert().getBreachStreak(),
                 props.getAlert().getRecoverStreak(),
                 props.getAlert().getCooldown().toMillis());
@@ -74,17 +103,26 @@ public class TelemetryBeans {
     public IngestionEngine ingestionEngine(TelemetryProperties props, Clock clock,
                                            EventDeduper deduper, WatermarkGenerator watermark,
                                            WindowStore windowStore, TraceRegistry traceRegistry,
-                                           AlertEngine alertEngine, IngestionMetrics metrics) {
+                                           AlertEngine alertEngine, IngestionMetrics metrics,
+                                           EventJournal journal, RuleVersionStore ruleStore,
+                                           RuleManager ruleManager) {
         return new IngestionEngine(props, watermark, windowStore, traceRegistry,
-                alertEngine, deduper, metrics);
+                alertEngine, deduper, metrics, journal, ruleStore, ruleManager);
+    }
+
+    @Bean
+    public ReplayService replayService(EventJournal journal, RuleVersionStore ruleStore,
+                                       TelemetryProperties props) {
+        return new ReplayService(journal, ruleStore, props);
     }
 
     @Bean
     public QueryService queryService(IngestionEngine engine, WindowStore windowStore,
                                      WatermarkGenerator watermark, TraceRegistry traceRegistry,
-                                     AlertEngine alertEngine, EventDeduper deduper) {
+                                     AlertEngine alertEngine, EventDeduper deduper,
+                                     ReplayService replayService) {
         return new QueryService(engine, windowStore, watermark, traceRegistry,
-                alertEngine, deduper);
+                alertEngine, deduper, replayService);
     }
 
     /**

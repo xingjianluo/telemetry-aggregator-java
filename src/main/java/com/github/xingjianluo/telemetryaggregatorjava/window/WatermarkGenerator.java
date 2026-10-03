@@ -23,6 +23,11 @@ public class WatermarkGenerator {
 
     private static final long NONE = Long.MIN_VALUE;
 
+    /** 尚未观察到任何事件时间时的水位线哨兵值。 */
+    public static long none() {
+        return NONE;
+    }
+
     private final long windowSizeMillis;
     private final long allowedLatenessMillis;
     private final boolean advanceOnIdle;
