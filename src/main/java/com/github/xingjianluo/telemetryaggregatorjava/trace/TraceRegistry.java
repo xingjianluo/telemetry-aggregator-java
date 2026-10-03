@@ -160,6 +160,15 @@ public class TraceRegistry {
                 trace.lastEventTime == Long.MIN_VALUE ? -1L : trace.lastEventTime);
     }
 
+    /** 当前全部调用链的快照（复盘报告用；数量受 maxTraces 约束）。 */
+    public synchronized List<TraceSnapshot> snapshotAll() {
+        List<TraceSnapshot> out = new ArrayList<>();
+        for (String traceId : traces.keySet()) {
+            out.add(snapshot(traceId));
+        }
+        return out;
+    }
+
     /** 回收超过保留期未再更新的调用链，保证内存有界。 */
     public synchronized void pruneIdle(long nowMillis, long retentionMillis) {
         traces.entrySet().removeIf(e -> nowMillis - e.getValue().lastTouchedMillis > retentionMillis);

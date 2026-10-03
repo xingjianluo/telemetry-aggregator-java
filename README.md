@@ -40,6 +40,10 @@ java -jar target/telemetry-aggregator-java-1.0-SNAPSHOT.jar
 | GET | `/alerts` | 查询全部规则 × 对象的告警状态与判定依据 |
 | GET | `/traces/{traceId}` | 查询调用链拓扑还原结果与状态原因 |
 | GET | `/metrics` | 接受量、按原因区分的拒绝量、队列堆积、基数占用、水位线 |
+| POST | `/rules/changes` | 在线变更告警规则（阈值/范围/启停/免打扰），无需重启；返回版本号与生效边界 |
+| GET | `/rules` | 当前生效规则集（含版本与免打扰边界） |
+| GET | `/rules/history` | 全部规则变更历史（版本升序，含每次的生效边界） |
+| GET | `/replay?asOfMillis=` | 按事件时间边界复盘：已定稿窗口聚合、当时规则版本、告警状态、链路结论 |
 
 事件字段：
 
@@ -158,6 +162,8 @@ curl -s localhost:8080/metrics
   * `FIRING`：连续 `alert.recover-streak`（默认 2）个窗口恢复才回 `OK`；
     单次回落维持 `FIRING`，不反复触发/恢复。
   * 状态翻转还受 `alert.cooldown`（默认 30s）冷却限制。
+    冷却与全部状态机计时均以**事件时间**（定稿窗口 end）为基准，与墙上时钟无关，
+    这是复盘可逐位复现告警结论的前提。
 * 调用链作用域下，链路为 ORPHAN/CYCLE/DUPLICATE_SPAN 时**继续按现有数据评估**，
   并在告警快照 `traceMarker` 中标注拓扑异常，保证结论可解释。
 
@@ -181,7 +187,85 @@ telemetry.alert.rules=cpu-hot,TAGS,svc-a,cpu,80,GT,host=h1;trace-slow,TRACE,svc-
 
 ---
 
-## 6. 本地验证（测试）
+## 6. 规则在线变更：版本与生效边界
+
+无需重启、无需断流即可调整告警规则。变更与事件写入**共用同一条有界队列**，
+在单一 worker 线程内与事件处理线性化：应用变更前先把所有可定稿窗口按旧规则定稿，
+再以当前水位线作为**生效边界**登记新版本，因此不会出现状态丢失、重复计数或新旧规则互相覆盖。
+
+* **生效边界语义**：变更记录 `effectiveFromMillis` = 应用时刻的事件时间水位线。
+  窗口结束时间 `end <= effectiveFrom` 的窗口在此之前已定稿，**维持原判**；
+  `end > effectiveFrom` 的窗口按新规则判定。实时评估与复盘共用同一解析函数
+  （`RuleRegistry.rulesForWindow(windowEnd)`），保证两侧结论一致。
+* **版本**：每次成功变更得到单调递增的 `version`（初始规则集为 0），
+  `GET /rules/history` 可查询全部版本及其生效边界；告警快照携带 `ruleVersion`，
+  可说明每条结论依据的是哪个版本。
+* **动作**：`UPSERT`（新建/更新阈值、匹配范围、操作符）、`DISABLE` / `ENABLE`
+  （停用期间不评估新窗口，主体状态保留，启用后续接）、`MUTE` / `UNMUTE`（见第 7 节）。
+* **失败语义**：非法变更（未知规则、缺定义、id 不一致）返回 422 与可区分错误，
+  不产生版本；背压 / 超时快速失败，不会把调用方挂住。
+
+```bash
+# 把规则 r 的阈值在线调整为 100
+curl -s -XPOST localhost:8080/rules/changes -H 'Content-Type: application/json' -d '{
+  "ruleId":"r","action":"UPSERT",
+  "rule":{"id":"r","scope":"TAGS","service":"svc","metric":"m",
+          "tagSelector":{},"threshold":100.0,"operator":"GT"}}'
+# 免打扰到事件时间 1727000100000
+curl -s -XPOST localhost:8080/rules/changes -H 'Content-Type: application/json' -d '{
+  "ruleId":"r","action":"MUTE","muteUntilMillis":1727000100000}'
+```
+
+---
+
+## 7. 免打扰语义（MUTE）
+
+* 免打扰区间按**事件时间**判定：窗口 `end <= muteUntilMillis` 的定稿窗口被抑制——
+  只记录证据（lastValue/lastWindow 照常更新），**不推进状态机**，快照标记 `muted=true`。
+* 抑制期间越界/恢复次数**不累计**（streak 清零），因此免打扰结束后必须按当前证据
+  重新累计 `breach-streak` / `recover-streak` 个连续窗口才翻转状态——
+  **平稳恢复，绝不一次性补发**期间累积的告警。
+* 已进入 FIRING 的对象在免打扰期间保持 FIRING 且 `muted=true`（不抹掉既有状态，
+  也不产生新的翻转）；`UNMUTE` 或区间结束后下一窗口立即恢复正常判定。
+
+---
+
+## 8. 按事件时间复盘（Replay）
+
+`GET /replay?asOfMillis=T` 对事件时间边界 T 重放**与实时完全相同的处理管道**
+（`EventProcessor`），在独立的状态副本上重建：
+
+* 边界内已定稿的窗口聚合（`end <= 复盘水位线`）；
+* 每个窗口当时生效的规则版本（按生效边界解析）与对应告警状态（含 `ruleVersion`、`muted`）；
+* 调用链拓扑结论（COMPLETE/ORPHAN/CYCLE/DUPLICATE_SPAN 及判定依据）；
+* 边界内被确定拒绝的事件按原因计数（审计依据）。
+
+**确定性与兼容范围**：
+
+* 复盘结果只由**事件日志**（每条已提交结论：接受或确定性拒绝）与**规则变更历史**决定；
+  告警状态机只使用事件时间（定稿窗口 end），与墙上时钟无关，因此同一批输入
+  无论何时、在哪台机器上复盘都得到同一结论；复盘不读写任何实时状态。
+* 复盘只接受事件时间 `<= T` 的证据，水位线由这批事件独立推进；
+  与实时在同一事件时间边界下产生的结论一致（实时/复盘一致性由
+  `RuleChangeConcurrencyTest` 的逐位比对保证）。
+* **不可复盘即明确拒绝**：`status=OUT_OF_RETENTION` 并说明原因，绝不给出看似完整、
+  实际缺数据的答案。触发条件：
+  * 事件日志容量（`telemetry.journal.max-events`，默认 10 万条）淘汰的最老事件时间
+    早于等于 T；
+  * 规则版本历史（`telemetry.rules.max-versions`，默认 1000）折叠后，
+    边界内窗口所需的旧版本已不可考。
+* **资源边界**：单次复盘最多处理 `telemetry.replay.max-events`（默认 20 万）条事件，
+  超出返回 `TOO_LARGE`；同时最多一个复盘在执行（其余快速失败 `BUSY`）；
+  调用方等待受 `telemetry.replay.timeout`（默认 30s）限制。
+  复盘在独立线程与独立状态副本上运行，不拖慢实时摄取。
+
+```bash
+curl -s 'localhost:8080/replay?asOfMillis=1727000000000'
+```
+
+---
+
+## 9. 本地验证（测试）
 
 ```bash
 mvn clean test
@@ -200,6 +284,12 @@ AGGREGATE / ALERT / STATE 行）。
 | `AlertStabilityTest` | 单点毛刺不报警、连续确认、瞬时回落不恢复、冷却防抖、标签选择器作用域 |
 | `TraceAlertTest` | ORPHAN/CYCLE 链路仍判定且带 traceMarker |
 | `EndToEndIntegrationTest` | 经 HTTP 的摄取→聚合→告警→链路→指标全链路对齐；重复 / 迟到的 HTTP 语义 |
+| `RuleHotUpdateTest` | 阈值在线调整的生效边界（边界前维持原判、边界后新规则）、启停续接、非法变更拒绝 |
+| `MuteRecoveryTest` | 免打扰抑制判定、结束后平稳恢复不补发、UNMUTE 立即恢复 |
+| `RuleChangeConcurrencyTest` | 8 线程并发摄取 + 20 次并发规则变更：计数守恒、版本连续、实时/复盘三视图逐位一致 |
+| `ReplayDeterminismTest` | 重复复盘逐位一致、与当时实时结论对齐、不改写实时状态、日志/规则历史超范围明确拒绝 |
+| `CrossViewConsistencyTest` | 同一事件/窗口/链路在聚合、链路、告警、复盘视图中的计入/排除与异常标记一致 |
+| `RuleReplayHttpTest` | HTTP 层规则变更、版本历史、复盘与 422 错误语义 |
 
 查看某次测试的输入与判定：
 

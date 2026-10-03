@@ -22,6 +22,14 @@ import java.util.concurrent.ConcurrentHashMap;
  *   <li>只有窗口定稿（关闭）才驱动评估，避免在线部分数据反复改写结论。</li>
  * </ul>
  *
+ * <p>时间基准：状态机只使用<b>事件时间</b>（定稿窗口的 end）作为“现在”，
+ * 不使用墙上时钟，因此同一批输入无论何时、在哪台机器上评估都得到同一结论，
+ * 这也是复盘可复现的前提。
+ *
+ * <p>规则版本化：每次评估使用调用方按窗口结束时间解析出的 {@link ResolvedRule}
+ * （规则定义 + 版本 + 免打扰边界）。免打扰区间内的窗口只记录证据、不推进状态机
+ * （streak 清零），免打扰结束后需重新累计确认次数，平稳恢复、绝不补发。
+ *
  * <p>调用链作用域：链路被标记为 ORPHAN/CYCLE/DUPLICATE_SPAN 时不中止判定，
  * 继续按当前数据评估并在快照中携带 traceMarker，保证结论可解释。
  */
@@ -33,7 +41,10 @@ public class AlertEngine {
         int consecutiveRecoveries;
         double lastValue = Double.NaN;
         long lastWindowStart = -1L;
+        /** 最近一次状态翻转发生的窗口 end（事件时间）。 */
         long lastChangedMillis = -1L;
+        long ruleVersion;
+        boolean muted;
         Map<String, String> tags = Map.of();
         String traceMarker;
         AlertRule.Scope scope = AlertRule.Scope.TAGS;
@@ -42,23 +53,22 @@ public class AlertEngine {
     private record SubjectKey(String ruleId, String subject) {
     }
 
-    private final List<AlertRule> rules;
     private final int breachStreak;
     private final int recoverStreak;
     private final long cooldownMillis;
 
     private final Map<SubjectKey, Subject> subjects = new ConcurrentHashMap<>();
 
-    public AlertEngine(List<AlertRule> rules, int breachStreak, int recoverStreak, long cooldownMillis) {
-        this.rules = List.copyOf(rules);
+    public AlertEngine(int breachStreak, int recoverStreak, long cooldownMillis) {
         this.breachStreak = Math.max(1, breachStreak);
         this.recoverStreak = Math.max(1, recoverStreak);
         this.cooldownMillis = Math.max(0, cooldownMillis);
     }
 
-    /** 标签作用域：每个关闭窗口的聚合按匹配的规则评估。 */
-    public void onWindowSealed(WindowAggregate aggregate) {
-        for (AlertRule rule : rules) {
+    /** 标签作用域：每个关闭窗口的聚合按该窗口生效的规则评估。 */
+    public void onWindowSealed(WindowAggregate aggregate, List<ResolvedRule> rules) {
+        for (ResolvedRule resolved : rules) {
+            AlertRule rule = resolved.rule();
             if (rule.scope() != AlertRule.Scope.TAGS) {
                 continue;
             }
@@ -70,15 +80,19 @@ public class AlertEngine {
             Subject subject = subjects.computeIfAbsent(new SubjectKey(rule.id(), key), k -> new Subject());
             subject.scope = AlertRule.Scope.TAGS;
             subject.tags = aggregate.tags();
-            evaluate(rule, subject, aggregate.avg(), aggregate.windowStartMillis(), null);
+            evaluate(resolved, subject, aggregate.avg(),
+                    aggregate.windowStartMillis(), aggregate.windowEndMillis(), null);
         }
     }
 
     /** 调用链作用域：由摄取管道按 trace 聚合的窗口结果驱动。 */
     public void onTraceWindowSealed(String traceId, String service, String metric,
                                     double avg, long count, long windowStartMillis,
-                                    TraceStatus traceStatus, List<String> traceReasons, long nowMillis) {
-        for (AlertRule rule : rules) {
+                                    long windowEndMillis,
+                                    TraceStatus traceStatus, List<String> traceReasons,
+                                    List<ResolvedRule> rules) {
+        for (ResolvedRule resolved : rules) {
+            AlertRule rule = resolved.rule();
             if (rule.scope() != AlertRule.Scope.TRACE) {
                 continue;
             }
@@ -92,7 +106,7 @@ public class AlertEngine {
             subject.scope = AlertRule.Scope.TRACE;
             String marker = traceStatus == TraceStatus.COMPLETE ? null
                     : traceStatus + (traceReasons.isEmpty() ? "" : ": " + traceReasons);
-            evaluate(rule, subject, avg, windowStartMillis, marker);
+            evaluate(resolved, subject, avg, windowStartMillis, windowEndMillis, marker);
         }
     }
 
@@ -112,15 +126,29 @@ public class AlertEngine {
         return true;
     }
 
-    private synchronized void evaluate(AlertRule rule, Subject subject, double value,
-                                       long windowStartMillis, String traceMarker) {
+    private synchronized void evaluate(ResolvedRule resolved, Subject subject, double value,
+                                       long windowStartMillis, long windowEndMillis,
+                                       String traceMarker) {
         subject.lastValue = value;
         subject.lastWindowStart = windowStartMillis;
+        subject.ruleVersion = resolved.version();
         if (traceMarker != null) {
             subject.traceMarker = traceMarker;
         }
-        boolean breach = rule.breaches(value);
-        long now = System.currentTimeMillis();
+
+        // 免打扰：窗口 end 落在免打扰区间内 -> 只记录证据，不推进状态机；
+        // streak 清零，免打扰结束后需按当前证据重新累计确认，平稳恢复、不补发。
+        if (resolved.muteUntilMillis() > 0 && windowEndMillis <= resolved.muteUntilMillis()) {
+            subject.muted = true;
+            subject.consecutiveBreaches = 0;
+            subject.consecutiveRecoveries = 0;
+            return;
+        }
+        subject.muted = false;
+
+        boolean breach = resolved.rule().breaches(value);
+        // 状态机时间基准 = 定稿窗口 end（事件时间），与墙上时钟无关，保证复盘可复现。
+        long now = windowEndMillis;
 
         if (subject.state == AlertState.FIRING) {
             if (breach) {
@@ -163,7 +191,7 @@ public class AlertEngine {
                         key.ruleId(), s.scope, key.subject(),
                         Map.copyOf(s.tags), s.state, s.consecutiveBreaches,
                         s.consecutiveRecoveries, s.lastValue, s.lastWindowStart,
-                        s.lastChangedMillis, s.traceMarker)));
+                        s.lastChangedMillis, s.traceMarker, s.ruleVersion, s.muted)));
         return out;
     }
 }

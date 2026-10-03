@@ -2,6 +2,11 @@ package com.github.xingjianluo.telemetryaggregatorjava.query;
 
 import com.github.xingjianluo.telemetryaggregatorjava.alert.AlertEngine;
 import com.github.xingjianluo.telemetryaggregatorjava.alert.AlertSnapshot;
+import com.github.xingjianluo.telemetryaggregatorjava.alert.ResolvedRule;
+import com.github.xingjianluo.telemetryaggregatorjava.alert.RuleChange;
+import com.github.xingjianluo.telemetryaggregatorjava.alert.RuleRegistry;
+import com.github.xingjianluo.telemetryaggregatorjava.replay.ReplayReport;
+import com.github.xingjianluo.telemetryaggregatorjava.replay.ReplayService;
 import com.github.xingjianluo.telemetryaggregatorjava.dedup.EventDeduper;
 import com.github.xingjianluo.telemetryaggregatorjava.ingest.IngestionEngine;
 import com.github.xingjianluo.telemetryaggregatorjava.model.WindowAggregate;
@@ -24,15 +29,35 @@ public class QueryService {
     private final TraceRegistry traceRegistry;
     private final AlertEngine alertEngine;
     private final EventDeduper deduper;
+    private final RuleRegistry ruleRegistry;
+    private final ReplayService replayService;
 
     public QueryService(IngestionEngine engine, WindowStore windowStore, WatermarkGenerator watermark,
-                        TraceRegistry traceRegistry, AlertEngine alertEngine, EventDeduper deduper) {
+                        TraceRegistry traceRegistry, AlertEngine alertEngine, EventDeduper deduper,
+                        RuleRegistry ruleRegistry, ReplayService replayService) {
         this.engine = engine;
         this.windowStore = windowStore;
         this.watermark = watermark;
         this.traceRegistry = traceRegistry;
         this.alertEngine = alertEngine;
         this.deduper = deduper;
+        this.ruleRegistry = ruleRegistry;
+        this.replayService = replayService;
+    }
+
+    /** 当前规则集（含版本与免打扰边界）。 */
+    public List<ResolvedRule> currentRules() {
+        return ruleRegistry.currentRules();
+    }
+
+    /** 全部规则变更历史（版本升序）。 */
+    public List<RuleChange> ruleHistory() {
+        return ruleRegistry.history();
+    }
+
+    /** 按事件时间边界复盘。 */
+    public ReplayReport replay(long asOfMillis) {
+        return replayService.replay(asOfMillis);
     }
 
     public List<WindowAggregate> queryAggregates(String service, String metric) {

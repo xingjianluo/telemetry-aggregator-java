@@ -15,12 +15,18 @@ public class TelemetryProperties {
     private final Cardinality cardinality = new Cardinality();
     private final Trace trace = new Trace();
     private final Alert alert = new Alert();
+    private final Rules rules = new Rules();
+    private final Journal journal = new Journal();
+    private final Replay replay = new Replay();
 
     public Window getWindow() { return window; }
     public Buffer getBuffer() { return buffer; }
     public Cardinality getCardinality() { return cardinality; }
     public Trace getTrace() { return trace; }
     public Alert getAlert() { return alert; }
+    public Rules getRules() { return rules; }
+    public Journal getJournal() { return journal; }
+    public Replay getReplay() { return replay; }
 
     /** 窗口与水位线参数。 */
     public static class Window {
@@ -108,6 +114,37 @@ public class TelemetryProperties {
 
         public Duration getRetention() { return retention; }
         public void setRetention(Duration retention) { this.retention = retention; }
+    }
+
+    /** 规则版本化参数。 */
+    public static class Rules {
+        /** 保留的规则变更版本数上限；超出后最老版本折叠进基线，更早边界不可复盘。 */
+        private int maxVersions = 1_000;
+
+        public int getMaxVersions() { return maxVersions; }
+        public void setMaxVersions(int maxVersions) { this.maxVersions = maxVersions; }
+    }
+
+    /** 复盘事件日志参数。 */
+    public static class Journal {
+        /** 日志保留的最大事件条数（含确定拒绝的结论），超出按事件时间最老淘汰。 */
+        private int maxEvents = 100_000;
+
+        public int getMaxEvents() { return maxEvents; }
+        public void setMaxEvents(int maxEvents) { this.maxEvents = maxEvents; }
+    }
+
+    /** 复盘资源边界参数。 */
+    public static class Replay {
+        /** 单次复盘允许处理的最大事件条数，超出显式返回 TOO_LARGE。 */
+        private int maxEvents = 200_000;
+        /** 调用方等待复盘结果的最长时间；超时快速失败（BUSY），不拖住调用方。 */
+        private Duration timeout = Duration.ofSeconds(30);
+
+        public int getMaxEvents() { return maxEvents; }
+        public void setMaxEvents(int maxEvents) { this.maxEvents = maxEvents; }
+        public Duration getTimeout() { return timeout; }
+        public void setTimeout(Duration timeout) { this.timeout = timeout; }
     }
 
     /** 告警稳定性参数。 */

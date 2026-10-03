@@ -2,10 +2,17 @@ package com.github.xingjianluo.telemetryaggregatorjava.tests;
 
 import com.github.xingjianluo.telemetryaggregatorjava.alert.AlertEngine;
 import com.github.xingjianluo.telemetryaggregatorjava.alert.AlertRule;
+import com.github.xingjianluo.telemetryaggregatorjava.alert.RuleChange;
+import com.github.xingjianluo.telemetryaggregatorjava.alert.RuleChangeRequest;
+import com.github.xingjianluo.telemetryaggregatorjava.alert.RuleRegistry;
+import com.github.xingjianluo.telemetryaggregatorjava.replay.ReplayReport;
+import com.github.xingjianluo.telemetryaggregatorjava.replay.ReplayService;
 import com.github.xingjianluo.telemetryaggregatorjava.config.TelemetryProperties;
 import com.github.xingjianluo.telemetryaggregatorjava.dedup.EventDeduper;
+import com.github.xingjianluo.telemetryaggregatorjava.ingest.EventProcessor;
 import com.github.xingjianluo.telemetryaggregatorjava.ingest.IngestionEngine;
 import com.github.xingjianluo.telemetryaggregatorjava.ingest.IngestionMetrics;
+import com.github.xingjianluo.telemetryaggregatorjava.replay.EventJournal;
 import com.github.xingjianluo.telemetryaggregatorjava.model.IngestResult;
 import com.github.xingjianluo.telemetryaggregatorjava.model.TelemetryEvent;
 import com.github.xingjianluo.telemetryaggregatorjava.trace.TraceRegistry;
@@ -38,11 +45,17 @@ final class TestHarness {
         final WindowStore windowStore;
         final TraceRegistry traceRegistry;
         final AlertEngine alertEngine;
+        final RuleRegistry ruleRegistry;
         final IngestionMetrics metrics;
+        final EventJournal journal;
+        final EventProcessor processor;
         final IngestionEngine engine;
+        final ReplayService replayService;
 
         Engine(TelemetryProperties props, List<AlertRule> rules, long cooldownMillis) {
             this.props = props;
+            // 冷却参数统一写回配置，保证实时与复盘（ReplayService 从 props 构造）使用同一值。
+            props.getAlert().setCooldown(java.time.Duration.ofMillis(cooldownMillis));
             this.deduper = new EventDeduper(props.getCardinality().getMaxEventIds());
             this.watermark = new WatermarkGenerator(
                     props.getWindow().getSizeMillis(),
@@ -55,13 +68,17 @@ final class TestHarness {
             this.traceRegistry = new TraceRegistry(
                     props.getCardinality().getMaxTraces(),
                     props.getCardinality().getMaxSpansPerTrace());
-            this.alertEngine = new AlertEngine(rules,
+            this.alertEngine = new AlertEngine(
                     props.getAlert().getBreachStreak(),
                     props.getAlert().getRecoverStreak(),
                     cooldownMillis);
+            this.ruleRegistry = new RuleRegistry(rules, props.getRules().getMaxVersions());
             this.metrics = new IngestionMetrics();
-            this.engine = new IngestionEngine(props, watermark, windowStore, traceRegistry,
-                    alertEngine, deduper, metrics);
+            this.journal = new EventJournal(props.getJournal().getMaxEvents());
+            this.processor = new EventProcessor(props, watermark, windowStore, traceRegistry,
+                    alertEngine, ruleRegistry, deduper, metrics, journal);
+            this.engine = new IngestionEngine(props, processor, metrics);
+            this.replayService = new ReplayService(props, journal, ruleRegistry);
         }
 
         IngestResult send(Logger log, TelemetryEvent e) {
@@ -72,6 +89,25 @@ final class TestHarness {
                     r.status(),
                     r.rejectReason() == null ? "" : r.rejectReason(),
                     r.detail() == null ? "" : " | " + r.detail());
+            return r;
+        }
+
+        RuleChange change(Logger log, RuleChangeRequest req) {
+            RuleChange c = engine.submitRuleChange(req);
+            log.info("RULE_CHANGE version={} rule={} action={} effectiveFrom={} muteUntil={} snapshot={}",
+                    c.version(), c.ruleId(), c.action(), c.effectiveFromMillis(),
+                    c.muteUntilMillis(), c.ruleSnapshot());
+            return c;
+        }
+
+        ReplayReport replay(Logger log, long asOfMillis) {
+            ReplayReport r = replayService.replay(asOfMillis);
+            log.info("REPLAY asOf={} => status={} watermark={} accepted={} sealedWindows={} detail={}",
+                    asOfMillis, r.status(), r.replayWatermarkMillis(), r.acceptedCount(),
+                    r.sealedWindowCount(), r.detail());
+            r.alerts().forEach(a -> log.info(
+                    "REPLAY_ALERT rule={} subject={} state={} ruleVersion={} muted={} value={}",
+                    a.ruleId(), a.subjectKey(), a.state(), a.ruleVersion(), a.muted(), a.lastValue()));
             return r;
         }
 
@@ -96,6 +132,7 @@ final class TestHarness {
         @Override
         public void close() {
             engine.shutdown();
+            replayService.shutdown();
         }
     }
 

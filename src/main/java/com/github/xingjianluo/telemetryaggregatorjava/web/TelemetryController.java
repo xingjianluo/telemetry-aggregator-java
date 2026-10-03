@@ -1,7 +1,11 @@
 package com.github.xingjianluo.telemetryaggregatorjava.web;
 
 import com.github.xingjianluo.telemetryaggregatorjava.alert.AlertSnapshot;
+import com.github.xingjianluo.telemetryaggregatorjava.alert.ResolvedRule;
+import com.github.xingjianluo.telemetryaggregatorjava.alert.RuleChange;
+import com.github.xingjianluo.telemetryaggregatorjava.alert.RuleChangeRequest;
 import com.github.xingjianluo.telemetryaggregatorjava.ingest.IngestionEngine;
+import com.github.xingjianluo.telemetryaggregatorjava.replay.ReplayReport;
 import com.github.xingjianluo.telemetryaggregatorjava.model.IngestResult;
 import com.github.xingjianluo.telemetryaggregatorjava.model.RejectReason;
 import com.github.xingjianluo.telemetryaggregatorjava.model.TelemetryEvent;
@@ -21,6 +25,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 /**
  * 摄取与查询的 HTTP 入口。
@@ -76,6 +81,47 @@ public class TelemetryController {
     @GetMapping("/metrics")
     public MetricsSnapshot metrics() {
         return queryService.metrics();
+    }
+
+    /**
+     * 在线变更告警规则（无需重启、不断流）。变更与事件写入在同一线性化点应用：
+     * 先生效边界之前的已定稿窗口维持原判，之后按新规则判定。
+     */
+    @PostMapping("/rules/changes")
+    public ResponseEntity<?> changeRule(@RequestBody RuleChangeRequest request) {
+        try {
+            RuleChange change = engine.submitRuleChange(request);
+            return ResponseEntity.ok(change);
+        } catch (IngestionEngine.RuleChangeException e) {
+            return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)
+                    .body(Map.of("error", "RULE_CHANGE_REJECTED",
+                            "detail", String.valueOf(e.getMessage())));
+        }
+    }
+
+    /** 当前生效规则集（含版本与免打扰边界）。 */
+    @GetMapping("/rules")
+    public List<ResolvedRule> rules() {
+        return queryService.currentRules();
+    }
+
+    /** 全部规则变更历史（版本升序，含每次的生效边界）。 */
+    @GetMapping("/rules/history")
+    public List<RuleChange> ruleHistory() {
+        return queryService.ruleHistory();
+    }
+
+    /**
+     * 按事件时间边界复盘：返回该边界处已定稿的窗口聚合、当时生效的规则版本、
+     * 告警状态与调用链结论。超出保留范围时 status=OUT_OF_RETENTION 并说明原因。
+     */
+    @GetMapping("/replay")
+    public ResponseEntity<ReplayReport> replay(@RequestParam long asOfMillis) {
+        try {
+            return ResponseEntity.ok(queryService.replay(asOfMillis));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY).build();
+        }
     }
 
     /** 请求体无法解析等：返回结构化拒绝，而不是静默 500。 */
