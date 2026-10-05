@@ -10,6 +10,8 @@ package com.github.xingjianluo.telemetryaggregatorjava.alert;
 public record RuleChange(
         /** 单调递增的版本号，从 1 开始（0 为初始规则集）。 */
         long version,
+        /** 产生该版本的幂等键；重试同一 requestId 永远返回这同一条记录。 */
+        String requestId,
         String ruleId,
         Action action,
         /** UPSERT 后的规则快照；其余动作为变更前已知的规则快照（可能为 null）。 */

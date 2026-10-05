@@ -69,7 +69,7 @@ class RuleHotUpdateTest {
             log.info("[STEP] 窗口[0,10) avg=20 阈值=10 => {} ruleVersion={}", s0.state(), s0.ruleVersion());
 
             // 在线把阈值调到 100：返回版本与生效边界（当前水位线=11）
-            RuleChange change = h.change(log, new RuleChangeRequest(
+            RuleChange change = h.change(log, TestHarness.changeReq(
                     "r", RuleChange.Action.UPSERT, rule(100), null));
             assertEquals(1L, change.version());
             assertEquals(11L, change.effectiveFromMillis(),
@@ -109,7 +109,7 @@ class RuleHotUpdateTest {
             windowValue(h, 0, 20); // FIRING
             assertEquals(AlertState.FIRING, snapshot(h).state());
 
-            h.change(log, new RuleChangeRequest("r", RuleChange.Action.DISABLE, null, null));
+            h.change(log, TestHarness.changeReq("r", RuleChange.Action.DISABLE, null, null));
             windowValue(h, 20, 5); // 停用期间：不评估，状态保持 FIRING，lastWindowStart 不前进
             AlertSnapshot disabled = snapshot(h);
             assertEquals(AlertState.FIRING, disabled.state());
@@ -118,7 +118,7 @@ class RuleHotUpdateTest {
             log.info("[STEP] DISABLE 期间窗口[20,30) 未评估，state={} lastWindow={}",
                     disabled.state(), disabled.lastEvaluatedWindowStart());
 
-            h.change(log, new RuleChangeRequest("r", RuleChange.Action.ENABLE, null, null));
+            h.change(log, TestHarness.changeReq("r", RuleChange.Action.ENABLE, null, null));
             windowValue(h, 40, 5); // 重新启用：恢复评估，连续恢复计数满足 => OK
             AlertSnapshot enabled = snapshot(h);
             assertEquals(AlertState.OK, enabled.state());
@@ -135,11 +135,11 @@ class RuleHotUpdateTest {
         try (TestHarness.Engine h = new TestHarness.Engine(props(), List.of(rule(10)), 0L)) {
             log.info("[CASE] 非法变更（未知规则 / 缺定义 / id 不一致）快速失败，不影响现有规则");
             assertThrows(IngestionEngine.RuleChangeException.class, () ->
-                    h.change(log, new RuleChangeRequest("ghost", RuleChange.Action.DISABLE, null, null)));
+                    h.change(log, TestHarness.changeReq("ghost", RuleChange.Action.DISABLE, null, null)));
             assertThrows(IngestionEngine.RuleChangeException.class, () ->
-                    h.change(log, new RuleChangeRequest("r", RuleChange.Action.UPSERT, null, null)));
+                    h.change(log, TestHarness.changeReq("r", RuleChange.Action.UPSERT, null, null)));
             assertThrows(IngestionEngine.RuleChangeException.class, () ->
-                    h.change(log, new RuleChangeRequest("r", RuleChange.Action.UPSERT,
+                    h.change(log, TestHarness.changeReq("r", RuleChange.Action.UPSERT,
                             new AlertRule("other", AlertRule.Scope.TAGS, null, null,
                                     Map.of(), 1, AlertRule.Operator.GT), null)));
             assertTrue(h.ruleRegistry.history().isEmpty(), "非法变更不得产生版本");

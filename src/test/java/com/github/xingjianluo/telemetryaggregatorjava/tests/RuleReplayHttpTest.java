@@ -101,11 +101,78 @@ class RuleReplayHttpTest {
                 .andExpect(jsonPath("$.ruleChanges[0].version").value(1));
         log.info("[ASSERT] HTTP 规则变更 / 历史 / 复盘全部符合预期");
 
-        // 非法变更：422 + 可区分错误
+        // 非法变更：422 + 可区分错误（确定无版本、无副作用）
         String bad = json.writeValueAsString(Map.of(
                 "ruleId", "ghost", "action", "DISABLE"));
         mvc.perform(post("/rules/changes").contentType(MediaType.APPLICATION_JSON).content(bad))
                 .andExpect(status().isUnprocessableEntity())
-                .andExpect(jsonPath("$.error").value("RULE_CHANGE_REJECTED"));
+                .andExpect(jsonPath("$.error").value("RULE_CHANGE_INVALID"));
+    }
+
+    @Test
+    void ruleChangeIsIdempotentByRequestIdAndAlertsCarryEvidence() throws Exception {
+        log.info("[CASE] HTTP 幂等：同 requestId 重发同版本且 replayed=true；同键不同载荷 422；告警带依据");
+        mvc.perform(post("/events").contentType(MediaType.APPLICATION_JSON).content(event("e1", 1, 20)))
+                .andExpect(status().isAccepted());
+        mvc.perform(post("/events").contentType(MediaType.APPLICATION_JSON).content(event("s1", 11, 0)))
+                .andExpect(status().isAccepted());
+
+        String body = json.writeValueAsString(java.util.Map.of(
+                "requestId", "http-idem-1",
+                "ruleId", "r", "action", "UPSERT",
+                "rule", java.util.Map.of("id", "r", "scope", "TAGS", "service", "svc",
+                        "metric", "m", "tagSelector", java.util.Map.of(),
+                        "threshold", 100.0, "operator", "GT")));
+
+        // 首次：replayed=false
+        mvc.perform(post("/rules/changes").contentType(MediaType.APPLICATION_JSON).content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.version").value(1))
+                .andExpect(jsonPath("$.requestId").value("http-idem-1"))
+                .andExpect(jsonPath("$.replayed").value(false))
+                .andExpect(jsonPath("$.effectiveFromMillis").value(11));
+
+        // 用 Idempotency-Key 头重试同一变更：同一版本、同一边界、replayed=true
+        String bodyWithoutId = json.writeValueAsString(java.util.Map.of(
+                "ruleId", "r", "action", "UPSERT",
+                "rule", java.util.Map.of("id", "r", "scope", "TAGS", "service", "svc",
+                        "metric", "m", "tagSelector", java.util.Map.of(),
+                        "threshold", 100.0, "operator", "GT")));
+        mvc.perform(post("/rules/changes")
+                        .header("Idempotency-Key", "http-idem-1")
+                        .contentType(MediaType.APPLICATION_JSON).content(bodyWithoutId))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.version").value(1))
+                .andExpect(jsonPath("$.replayed").value(true))
+                .andExpect(jsonPath("$.effectiveFromMillis").value(11));
+
+        // 历史仍只有一条
+        mvc.perform(get("/rules/history"))
+                .andExpect(jsonPath("$.length()").value(1))
+                .andExpect(jsonPath("$[0].requestId").value("http-idem-1"));
+
+        // 同键不同载荷 => 422，不产生版本
+        String conflicting = json.writeValueAsString(java.util.Map.of(
+                "requestId", "http-idem-1",
+                "ruleId", "r", "action", "UPSERT",
+                "rule", java.util.Map.of("id", "r", "scope", "TAGS", "service", "svc",
+                        "metric", "m", "tagSelector", java.util.Map.of(),
+                        "threshold", 200.0, "operator", "GT")));
+        mvc.perform(post("/rules/changes").contentType(MediaType.APPLICATION_JSON).content(conflicting))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error").value("RULE_CHANGE_INVALID"));
+        mvc.perform(get("/rules/history")).andExpect(jsonPath("$.length()").value(1));
+
+        // 告警与复盘都带可读判定依据
+        mvc.perform(get("/alerts"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$[0].evidence").isNotEmpty())
+                .andExpect(jsonPath("$[0].evidence[0].rationale").isNotEmpty())
+                .andExpect(jsonPath("$[0].evidence[0].windowEndMillis").value(10));
+        mvc.perform(get("/replay").param("asOfMillis", "11"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.alerts[0].evidence").isNotEmpty())
+                .andExpect(jsonPath("$.alerts[0].evidence[0].rationale").isNotEmpty());
+        log.info("[ASSERT] HTTP 幂等 / 冲突拒绝 / 告警依据全部符合预期");
     }
 }

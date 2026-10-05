@@ -79,7 +79,8 @@ class RuleChangeConcurrencyTest {
                     start.await();
                     for (int c = 0; c < CHANGES; c++) {
                         double threshold = c % 2 == 0 ? 50.0 : 150.0;
-                        h.engine.submitRuleChange(new RuleChangeRequest("r",
+                        h.engine.submitRuleChange(new RuleChangeRequest(
+                                "chg-" + c, "r",
                                 RuleChange.Action.UPSERT,
                                 new AlertRule("r", AlertRule.Scope.TAGS, null, "m",
                                         Map.of(), threshold, AlertRule.Operator.GT),

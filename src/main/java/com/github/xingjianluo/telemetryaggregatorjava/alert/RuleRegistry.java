@@ -36,14 +36,63 @@ public class RuleRegistry {
     private final List<RuleChange> history = new ArrayList<>();
     private long nextVersion = 1L;
     private Long oldestEvictedEffectiveFrom;
+    /**
+     * 幂等登记表：requestId -> 首次提交产生的变更记录。
+     * 只在 worker 线性化点访问；有界（插入序，超出淘汰最老），
+     * 淘汰窗口由 {@code maxIdempotencyKeys} 控制，独立于版本历史折叠，
+     * 因此重试即便在旧版本已折叠进基线后仍能命中同一条记录。
+     */
+    private final Map<String, RuleChange> changeByIdempotencyKey;
+    private final int maxIdempotencyKeys;
+    /** 首次登记时记录的原始请求，用于识别“同键不同载荷”的冲突提交。 */
+    private final Map<String, RuleChangeRequest> requestByKey;
 
     public RuleRegistry(List<AlertRule> initialRules, int maxVersions) {
+        this(initialRules, maxVersions, Math.max(64, maxVersions * 2));
+    }
+
+    public RuleRegistry(List<AlertRule> initialRules, int maxVersions, int maxIdempotencyKeys) {
         this.maxVersions = Math.max(1, maxVersions);
+        this.maxIdempotencyKeys = Math.max(1, maxIdempotencyKeys);
+        this.changeByIdempotencyKey = new LinkedHashMap<>();
+        this.requestByKey = new LinkedHashMap<>();
         for (AlertRule rule : initialRules) {
             MutableRule state = new MutableRule(rule, 0L, true, 0L);
             current.put(rule.id(), state);
             baseline.put(rule.id(), state);
         }
+    }
+
+    /**
+     * 幂等查找（worker 线性化点调用，先于定稿窗口）：
+     * <ul>
+     *   <li>返回非 null：该 requestId 的变更此前已生效，直接返回首次记录，
+     *       调用方不得再次定稿窗口或改动任何状态；</li>
+     *   <li>抛出 {@link IllegalArgumentException}：同键但载荷与首次不一致；</li>
+     *   <li>返回 null：首次提交，调用方继续“先定稿后应用”。</li>
+     * </ul>
+     * requestId 为 null 时不做幂等处理。
+     */
+    public synchronized RuleChange findByIdempotencyKey(RuleChangeRequest request) {
+        if (request == null || request.requestId() == null || request.requestId().isBlank()) {
+            return null;
+        }
+        RuleChange existing = changeByIdempotencyKey.get(request.requestId());
+        if (existing != null) {
+            RuleChangeRequest first = requestByKey.get(request.requestId());
+            if (first != null && !samePayload(first, request)) {
+                throw new IllegalArgumentException("requestId=" + request.requestId()
+                        + " 已用于另一条不同内容的变更，不能复用幂等键");
+            }
+        }
+        return existing;
+    }
+
+    private static boolean samePayload(RuleChangeRequest a, RuleChangeRequest b) {
+        return java.util.Objects.equals(a.ruleId(), b.ruleId())
+                && a.action() == b.action()
+                && java.util.Objects.equals(a.rule(), b.rule())
+                && java.util.Objects.equals(a.muteUntilMillis(), b.muteUntilMillis());
     }
 
     /**
@@ -70,11 +119,29 @@ public class RuleRegistry {
             default -> throw new IllegalArgumentException("未知动作: " + request.action());
         }
         current.put(ruleId, after);
-        RuleChange change = new RuleChange(version, ruleId, request.action(),
+        RuleChange change = new RuleChange(version, request.requestId(), ruleId, request.action(),
                 after.rule(), muteUntil, effectiveFromMillis, nowMillis);
         history.add(change);
+        registerIdempotencyKey(request, change);
         enforceHistoryBound();
         return change;
+    }
+
+    /** 登记幂等键（有界）：键的生命周期独立于版本历史折叠，重试在折叠后仍可命中。 */
+    private void registerIdempotencyKey(RuleChangeRequest request, RuleChange change) {
+        String key = request.requestId();
+        if (key == null || key.isBlank()) {
+            return;
+        }
+        changeByIdempotencyKey.put(key, change);
+        requestByKey.put(key, request);
+        java.util.Iterator<Map.Entry<String, RuleChange>> it =
+                changeByIdempotencyKey.entrySet().iterator();
+        while (changeByIdempotencyKey.size() > maxIdempotencyKeys && it.hasNext()) {
+            Map.Entry<String, RuleChange> oldest = it.next();
+            it.remove();
+            requestByKey.remove(oldest.getKey());
+        }
     }
 
     private void validate(RuleChangeRequest request) {

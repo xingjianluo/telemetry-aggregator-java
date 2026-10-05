@@ -60,7 +60,7 @@ class MuteRecoveryTest {
             windowValue(h, 0, 20); // 越界 1/2 => PENDING
             assertEquals(AlertState.PENDING, snapshot(h).state());
 
-            RuleChange mute = h.change(log, new RuleChangeRequest(
+            RuleChange mute = h.change(log, TestHarness.changeReq(
                     "r", RuleChange.Action.MUTE, null, 35L));
             log.info("[STEP] 免打扰至事件时间 35（窗口 end<=35 抑制判定）version={}", mute.version());
 
@@ -98,7 +98,7 @@ class MuteRecoveryTest {
             windowValue(h, 0, 20); // FIRING
             assertEquals(AlertState.FIRING, snapshot(h).state());
 
-            h.change(log, new RuleChangeRequest("r", RuleChange.Action.MUTE, null, 35L));
+            h.change(log, TestHarness.changeReq("r", RuleChange.Action.MUTE, null, 35L));
 
             windowValue(h, 10, 5); // end=20：抑制，恢复证据不累计
             AlertSnapshot m = snapshot(h);
@@ -124,12 +124,12 @@ class MuteRecoveryTest {
     void unmuteRestoresEvaluationImmediately() {
         try (TestHarness.Engine h = new TestHarness.Engine(props(1, 1), List.of(rule()), 0L)) {
             log.info("[CASE] UNMUTE 提前解除免打扰：下一窗口立即恢复正常判定");
-            h.change(log, new RuleChangeRequest("r", RuleChange.Action.MUTE, null, 1000L));
+            h.change(log, TestHarness.changeReq("r", RuleChange.Action.MUTE, null, 1000L));
             windowValue(h, 0, 20); // end=10 <= 1000：抑制
             assertTrue(snapshot(h).muted());
             assertEquals(AlertState.OK, snapshot(h).state());
 
-            h.change(log, new RuleChangeRequest("r", RuleChange.Action.UNMUTE, null, null));
+            h.change(log, TestHarness.changeReq("r", RuleChange.Action.UNMUTE, null, null));
             windowValue(h, 20, 20); // 已解除：正常判定 => FIRING
             AlertSnapshot s = snapshot(h);
             assertFalse(s.muted());

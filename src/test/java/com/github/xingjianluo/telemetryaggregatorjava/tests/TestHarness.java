@@ -71,7 +71,8 @@ final class TestHarness {
             this.alertEngine = new AlertEngine(
                     props.getAlert().getBreachStreak(),
                     props.getAlert().getRecoverStreak(),
-                    cooldownMillis);
+                    cooldownMillis,
+                    props.getAlert().getEvidenceTrailSize());
             this.ruleRegistry = new RuleRegistry(rules, props.getRules().getMaxVersions());
             this.metrics = new IngestionMetrics();
             this.journal = new EventJournal(props.getJournal().getMaxEvents());
@@ -93,11 +94,20 @@ final class TestHarness {
         }
 
         RuleChange change(Logger log, RuleChangeRequest req) {
-            RuleChange c = engine.submitRuleChange(req);
-            log.info("RULE_CHANGE version={} rule={} action={} effectiveFrom={} muteUntil={} snapshot={}",
-                    c.version(), c.ruleId(), c.action(), c.effectiveFromMillis(),
-                    c.muteUntilMillis(), c.ruleSnapshot());
-            return c;
+            com.github.xingjianluo.telemetryaggregatorjava.alert.RuleChangeOutcome outcome =
+                    submitChange(log, req);
+            return outcome.change();
+        }
+
+        com.github.xingjianluo.telemetryaggregatorjava.alert.RuleChangeOutcome submitChange(
+                Logger log, RuleChangeRequest req) {
+            com.github.xingjianluo.telemetryaggregatorjava.alert.RuleChangeOutcome outcome =
+                    engine.submitRuleChange(req);
+            RuleChange c = outcome.change();
+            log.info("RULE_CHANGE requestId={} replayed={} version={} rule={} action={} effectiveFrom={} muteUntil={} snapshot={}",
+                    c.requestId(), outcome.replayed(), c.version(), c.ruleId(), c.action(),
+                    c.effectiveFromMillis(), c.muteUntilMillis(), c.ruleSnapshot());
+            return outcome;
         }
 
         ReplayReport replay(Logger log, long asOfMillis) {
@@ -105,9 +115,20 @@ final class TestHarness {
             log.info("REPLAY asOf={} => status={} watermark={} accepted={} sealedWindows={} detail={}",
                     asOfMillis, r.status(), r.replayWatermarkMillis(), r.acceptedCount(),
                     r.sealedWindowCount(), r.detail());
-            r.alerts().forEach(a -> log.info(
-                    "REPLAY_ALERT rule={} subject={} state={} ruleVersion={} muted={} value={}",
-                    a.ruleId(), a.subjectKey(), a.state(), a.ruleVersion(), a.muted(), a.lastValue()));
+            r.alerts().forEach(a -> {
+                log.info(
+                        "REPLAY_ALERT rule={} subject={} state={} ruleVersion={} muted={} value={} evidenceSteps={}",
+                        a.ruleId(), a.subjectKey(), a.state(), a.ruleVersion(), a.muted(),
+                        a.lastValue(), a.evidence().size());
+                a.evidence().forEach(v -> log.info(
+                        "REPLAY_BASIS rule={} subject={} v{} window=[{},{}) avg={}/n={} {} => {}->{} muted={} breach={} streak={}/{} transition={} suppressed={} | {}",
+                        a.ruleId(), a.subjectKey(), v.ruleVersion(),
+                        v.windowStartMillis(), v.windowEndMillis(), v.avg(), v.count(),
+                        v.operator() + " " + v.threshold(), v.stateBefore(), v.stateAfter(),
+                        v.muted(), v.breach(), v.consecutiveBreaches(),
+                        v.consecutiveRecoveries(), v.transition(), v.suppressed(),
+                        v.rationale()));
+            });
             return r;
         }
 
@@ -122,11 +143,22 @@ final class TestHarness {
                     "AGGREGATE window=[{},{}) service={} metric={} tags={} count={} sum={} min={} max={} avg={}",
                     a.windowStartMillis(), a.windowEndMillis(), a.service(), a.metric(),
                     a.tags(), a.count(), a.sum(), a.min(), a.max(), a.avg()));
-            alertEngine.snapshots().forEach(s -> log.info(
-                    "ALERT rule={} scope={} subject={} state={} breachStreak={} recoverStreak={} value={} window={} marker={}",
-                    s.ruleId(), s.scope(), s.subjectKey(), s.state(),
-                    s.consecutiveBreaches(), s.consecutiveRecoveries(),
-                    s.lastValue(), s.lastEvaluatedWindowStart(), s.traceMarker()));
+            alertEngine.snapshots().forEach(s -> {
+                log.info(
+                        "ALERT rule={} scope={} subject={} state={} breachStreak={} recoverStreak={} value={} window={} marker={} ruleVersion={} muted={} evidenceSteps={}",
+                        s.ruleId(), s.scope(), s.subjectKey(), s.state(),
+                        s.consecutiveBreaches(), s.consecutiveRecoveries(),
+                        s.lastValue(), s.lastEvaluatedWindowStart(), s.traceMarker(),
+                        s.ruleVersion(), s.muted(), s.evidence().size());
+                s.evidence().forEach(v -> log.info(
+                        "BASIS rule={} subject={} v{} window=[{},{}) avg={}/n={} {} => {}->{} muted={} breach={} streak={}/{} transition={} suppressed={} | {}",
+                        s.ruleId(), s.subjectKey(), v.ruleVersion(),
+                        v.windowStartMillis(), v.windowEndMillis(), v.avg(), v.count(),
+                        v.operator() + " " + v.threshold(), v.stateBefore(), v.stateAfter(),
+                        v.muted(), v.breach(), v.consecutiveBreaches(),
+                        v.consecutiveRecoveries(), v.transition(), v.suppressed(),
+                        v.rationale()));
+            });
         }
 
         @Override
@@ -139,5 +171,21 @@ final class TestHarness {
     static TelemetryEvent event(String id, long t, String traceId, String spanId, String parent,
                                 String service, String metric, double value, Map<String, String> tags) {
         return new TelemetryEvent(id, t, traceId, spanId, parent, service, metric, value, tags);
+    }
+
+    private static final java.util.concurrent.atomic.AtomicLong REQUEST_SEQ =
+            new java.util.concurrent.atomic.AtomicLong();
+
+    /** 构造带显式幂等键的变更请求（同键重试请复用同一个 requestId）。 */
+    static RuleChangeRequest changeReq(String requestId, String ruleId, RuleChange.Action action,
+                                       AlertRule rule, Long muteUntilMillis) {
+        return new RuleChangeRequest(requestId, ruleId, action, rule, muteUntilMillis);
+    }
+
+    /** 构造带自动幂等键的变更请求（每个不同的逻辑变更调用一次）。 */
+    static RuleChangeRequest changeReq(String ruleId, RuleChange.Action action,
+                                       AlertRule rule, Long muteUntilMillis) {
+        return new RuleChangeRequest(
+                "req-" + REQUEST_SEQ.incrementAndGet(), ruleId, action, rule, muteUntilMillis);
     }
 }

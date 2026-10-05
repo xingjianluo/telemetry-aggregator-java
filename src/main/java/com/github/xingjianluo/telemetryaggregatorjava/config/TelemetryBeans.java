@@ -68,7 +68,10 @@ public class TelemetryBeans {
             rules = List.of(new AlertRule("default-avg-gt-100", AlertRule.Scope.TAGS,
                     null, null, Map.of(), 100.0, AlertRule.Operator.GT));
         }
-        return new RuleRegistry(rules, props.getRules().getMaxVersions());
+        int maxKeys = props.getRules().getMaxIdempotencyKeys() > 0
+                ? props.getRules().getMaxIdempotencyKeys()
+                : Math.max(64, props.getRules().getMaxVersions() * 2);
+        return new RuleRegistry(rules, props.getRules().getMaxVersions(), maxKeys);
     }
 
     @Bean
@@ -76,7 +79,8 @@ public class TelemetryBeans {
         return new AlertEngine(
                 props.getAlert().getBreachStreak(),
                 props.getAlert().getRecoverStreak(),
-                props.getAlert().getCooldown().toMillis());
+                props.getAlert().getCooldown().toMillis(),
+                props.getAlert().getEvidenceTrailSize());
     }
 
     @Bean

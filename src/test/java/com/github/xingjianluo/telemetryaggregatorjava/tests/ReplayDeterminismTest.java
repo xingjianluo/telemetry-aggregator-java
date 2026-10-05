@@ -60,7 +60,7 @@ class ReplayDeterminismTest {
             log.info("[CASE] 含一次规则变更的输入流：复盘与实时结论对齐，重复复盘逐位一致");
 
             windowValue(h, 0, 20);   // 窗口[0,10) => FIRING（v0）
-            h.change(log, new RuleChangeRequest("r", RuleChange.Action.UPSERT, rule(100), null));
+            h.change(log, TestHarness.changeReq("r", RuleChange.Action.UPSERT, rule(100), null));
             windowValue(h, 20, 20);  // 窗口[20,30) => 新阈值不越界 => OK（v1）
 
             // 实时当前结论
@@ -135,9 +135,9 @@ class ReplayDeterminismTest {
         try (TestHarness.Engine h = new TestHarness.Engine(p, List.of(rule(10)), 0L)) {
             log.info("[CASE] 规则版本历史上限=1，两次变更后最早版本被折叠：依赖旧版本的窗口不可复盘");
             windowValue(h, 0, 20);
-            h.change(log, new RuleChangeRequest("r", RuleChange.Action.UPSERT, rule(100), null));
+            h.change(log, TestHarness.changeReq("r", RuleChange.Action.UPSERT, rule(100), null));
             windowValue(h, 20, 20);
-            h.change(log, new RuleChangeRequest("r", RuleChange.Action.UPSERT, rule(1000), null));
+            h.change(log, TestHarness.changeReq("r", RuleChange.Action.UPSERT, rule(1000), null));
             windowValue(h, 40, 5);
             assertNotNull(h.ruleRegistry.oldestEvictedEffectiveFromMillis());
             log.info("[STEP] 规则历史已折叠，oldestEvictedEffectiveFrom={}",

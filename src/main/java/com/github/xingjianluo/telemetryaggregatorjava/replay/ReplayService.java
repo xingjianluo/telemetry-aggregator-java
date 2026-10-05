@@ -117,7 +117,8 @@ public class ReplayService {
         AlertEngine alertEngine = new AlertEngine(
                 props.getAlert().getBreachStreak(),
                 props.getAlert().getRecoverStreak(),
-                props.getAlert().getCooldown().toMillis());
+                props.getAlert().getCooldown().toMillis(),
+                props.getAlert().getEvidenceTrailSize());
         EventDeduper deduper = new EventDeduper(
                 Math.max(props.getCardinality().getMaxEventIds(), entries.size() + 1));
         EventProcessor processor = new EventProcessor(props, watermark, windowStore,

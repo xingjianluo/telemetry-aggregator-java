@@ -200,14 +200,29 @@ public class EventProcessor {
     }
 
     /**
-     * 应用规则变更（与事件处理同一线性化点）：
-     * 先把所有可定稿窗口按当前（旧）规则定稿，再以当前水位线为生效边界登记变更。
-     * 因此 end <= 边界的窗口永远维持原判，end > 边界的窗口按新规则判定。
+     * 应用规则变更（与事件处理同一线性化点）。
+     *
+     * <p>幂等：先按 requestId 查重。命中（重试 / 并发重发）时直接返回<b>首次</b>记录，
+     * 不定稿任何窗口、不推进规则状态——因此边界之前已定稿窗口的结论与边界之后窗口的
+     * 判定都不会因重试而变化，版本号与生效边界每次完全一致。
+     * 首次提交才先把可定稿窗口按当前（旧）规则定稿，再以当前水位线为生效边界登记变更。
      */
     public RuleChange applyRuleChange(RuleChangeRequest request) {
+        RuleChange existing = ruleRegistry.findByIdempotencyKey(request);
+        if (existing != null) {
+            return existing;
+        }
         sealWindowsAndEvaluate();
         return ruleRegistry.applyChange(request, watermark.currentWatermark(),
                 System.currentTimeMillis());
+    }
+
+    /**
+     * 幂等查找（不定稿窗口、不改动任何状态）：返回该 requestId 已生效的首次记录；
+     * 未命中返回 null。供 worker 在执行变更任务前区分“首次生效 / 幂等重放”。
+     */
+    public RuleChange findAppliedChange(RuleChangeRequest request) {
+        return ruleRegistry.findByIdempotencyKey(request);
     }
 
     /** 周期推进：空闲水位线推进 + 定稿 + 调用链回收。 */

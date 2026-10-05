@@ -40,7 +40,7 @@ java -jar target/telemetry-aggregator-java-1.0-SNAPSHOT.jar
 | GET | `/alerts` | 查询全部规则 × 对象的告警状态与判定依据 |
 | GET | `/traces/{traceId}` | 查询调用链拓扑还原结果与状态原因 |
 | GET | `/metrics` | 接受量、按原因区分的拒绝量、队列堆积、基数占用、水位线 |
-| POST | `/rules/changes` | 在线变更告警规则（阈值/范围/启停/免打扰），无需重启；返回版本号与生效边界 |
+| POST | `/rules/changes` | 在线变更告警规则（阈值/范围/启停/免打扰），无需重启；按 requestId / Idempotency-Key 幂等，返回版本号、生效边界与 replayed；失败分 422 非法 / 503 背压 / 408 超时三类 |
 | GET | `/rules` | 当前生效规则集（含版本与免打扰边界） |
 | GET | `/rules/history` | 全部规则变更历史（版本升序，含每次的生效边界） |
 | GET | `/replay?asOfMillis=` | 按事件时间边界复盘：已定稿窗口聚合、当时规则版本、告警状态、链路结论 |
@@ -167,6 +167,29 @@ curl -s localhost:8080/metrics
 * 调用链作用域下，链路为 ORPHAN/CYCLE/DUPLICATE_SPAN 时**继续按现有数据评估**，
   并在告警快照 `traceMarker` 中标注拓扑异常，保证结论可解释。
 
+### 告警结论字段与判定依据（evidence）
+
+`GET /alerts` 与复盘报告中的每条告警（`AlertSnapshot`）除了状态与计数，还携带
+**按事件时间升序的判定依据链** `evidence`（最近 `telemetry.alert.evidence-trail-size`
+条，默认 64，实时与复盘共用同一上界）。每条 `evidence` 完整回答“这一步是怎么判的”：
+
+| 字段 | 含义 |
+| --- | --- |
+| `windowStartMillis` / `windowEndMillis` | 依据的窗口 `[start,end)`（事件时间）；end 同时是状态机的“现在”与生效边界判定基准 |
+| `avg` / `count` | 该窗口参与比较的聚合均值与样本数（即“哪份证据”） |
+| `ruleVersion` / `threshold` / `operator` / `service` / `metric` | 该窗口实际使用的规则版本、阈值、操作符与匹配范围 |
+| `breach` | 均值在该阈值/操作符下是否越界 |
+| `consecutiveBreaches` / `consecutiveRecoveries` | 评估后的连续越界 / 连续恢复计数（毛刺确认、平稳恢复均可读） |
+| `stateBefore` / `stateAfter` / `transition` | 评估前后状态（OK/PENDING/FIRING）及本次是否翻转——可解释“为什么从正常翻成告警” |
+| `suppressed` | 已满足确认次数但被冷却（cooldown）抑制、维持原状态 |
+| `muted` / `muteUntilMillis` | 本次是否处在免打扰区间及其截止；免打扰窗口 streak 归 0、`transition=false`，文案明确“越界但被抑制、不累计” |
+| `traceMarker` | TRACE 作用域下的拓扑异常标记（ORPHAN/CYCLE/DUPLICATE_SPAN） |
+| `rationale` | 人类可读的一句话判定说明（窗口、均值、阈值版本、计数、翻转/抑制/免打扰原因） |
+
+依据链只由事件时间、窗口聚合与规则版本历史决定，不含墙上时钟/线程/随机量：
+同一批输入在同一时间边界下，**实时产生的结论与复盘结论（含整条 evidence）逐位一致**；
+重复复盘、在不同机器/不同时刻复盘也完全相同。
+
 ### 规则配置
 
 `telemetry.alert.rules`，分号分隔多条，逗号分隔字段：
@@ -187,7 +210,7 @@ telemetry.alert.rules=cpu-hot,TAGS,svc-a,cpu,80,GT,host=h1;trace-slow,TRACE,svc-
 
 ---
 
-## 6. 规则在线变更：版本与生效边界
+## 6. 规则在线变更：版本、生效边界、幂等与失败语义
 
 无需重启、无需断流即可调整告警规则。变更与事件写入**共用同一条有界队列**，
 在单一 worker 线程内与事件处理线性化：应用变更前先把所有可定稿窗口按旧规则定稿，
@@ -197,23 +220,68 @@ telemetry.alert.rules=cpu-hot,TAGS,svc-a,cpu,80,GT,host=h1;trace-slow,TRACE,svc-
   窗口结束时间 `end <= effectiveFrom` 的窗口在此之前已定稿，**维持原判**；
   `end > effectiveFrom` 的窗口按新规则判定。实时评估与复盘共用同一解析函数
   （`RuleRegistry.rulesForWindow(windowEnd)`），保证两侧结论一致。
-* **版本**：每次成功变更得到单调递增的 `version`（初始规则集为 0），
+* **版本**：每次**不同的成功变更**得到单调递增的 `version`（初始规则集为 0），
   `GET /rules/history` 可查询全部版本及其生效边界；告警快照携带 `ruleVersion`，
   可说明每条结论依据的是哪个版本。
 * **动作**：`UPSERT`（新建/更新阈值、匹配范围、操作符）、`DISABLE` / `ENABLE`
   （停用期间不评估新窗口，主体状态保留，启用后续接）、`MUTE` / `UNMUTE`（见第 7 节）。
-* **失败语义**：非法变更（未知规则、缺定义、id 不一致）返回 422 与可区分错误，
-  不产生版本；背压 / 超时快速失败，不会把调用方挂住。
+
+### 6.1 幂等重试（同一变更任意次重发只落一个版本）
+
+每次变更请求由调用方携带**幂等键** `requestId`（推荐为这次“逻辑变更”生成一个 UUID，
+重试时保持不变；也可用 HTTP 头 `Idempotency-Key`）。服务端在 worker 线性化点按键去重：
+
+* 同一 `requestId` + 相同内容的请求（顺序重试、超时重发、并发重发）**永远只产生一个版本**，
+  每次返回**同一个版本号、同一个生效边界、同一份规则快照**；
+  响应中的 `replayed=false` 表示首次生效，`replayed=true` 表示此前已生效、本次为无副作用重放。
+* 重试命中时**不会再次定稿窗口、不会第二次改动规则状态**：
+  边界之前已定稿窗口的结论、边界之后窗口的判定都不随重试变化。
+* 同一 `requestId` 但内容不同（想复用键提交另一条变更）按非法变更拒绝（422），不产生版本。
+* 幂等登记表有界（`telemetry.rules.max-idempotency-keys`，默认 2000，超出淘汰最老键），
+  其生命周期独立于版本历史折叠；请在保留窗口内完成重试。
+* 不显式携带键时，服务端按请求体内容生成一个内容键——只保证**字节级完全相同的重发**幂等；
+  生产调用方应始终显式携带 `requestId`。
+* 变更与并发摄取同时发生时，不同变更仍各自占一个版本，版本号连续、不丢失、不互相覆盖
+  （与事件计数同一条线性化队列保证）。
+
+成功响应（顶层即版本字段，向后兼容）：
+
+```json
+{
+  "version": 1,
+  "requestId": "8f1c...",
+  "replayed": false,
+  "ruleId": "r",
+  "action": "UPSERT",
+  "ruleSnapshot": { "id": "r", "scope": "TAGS", "service": "svc", "metric": "m",
+                    "tagSelector": {}, "threshold": 100.0, "operator": "GT" },
+  "muteUntilMillis": null,
+  "effectiveFromMillis": 11,
+  "appliedAtMillis": 1780000000000
+}
+```
+
+### 6.2 失败语义（三类可区分结果）
+
+| 情形 | HTTP | error | applied | 含义与处理 |
+| --- | --- | --- | --- | --- |
+| 非法变更（未知规则、缺定义、id 不一致、同键不同载荷、MUTE 边界非法） | 422 | `RULE_CHANGE_INVALID` | false | **确定无版本、无任何状态改动**，快速拒绝；不要用同键重试，应修正请求后换新键 |
+| 背压（队列满，未能入队） | 503 | `RULE_CHANGE_BACKPRESSURE` | false | **确定未生效**（未登记、无版本）；稍后用**同一 requestId** 重试安全 |
+| 等待回执超时 | 408 | `RULE_CHANGE_TIMEOUT` | `"UNKNOWN"` | **结论不确定**：可能根本未生效，也可能已生效只是回执丢失。**必须用同一 requestId 重试**——未生效则首次应用并返回版本；已生效则 `replayed=true` 重放同一版本，绝不会产生第二个版本 |
+
+超时返回时服务端**不会取消**正在排队/执行的变更任务，因此“先超时后生效”是正常情形，
+依靠同键重试即可收敛到唯一确定的结论；调用方不需要、也不应该猜测是否生效。
 
 ```bash
-# 把规则 r 的阈值在线调整为 100
-curl -s -XPOST localhost:8080/rules/changes -H 'Content-Type: application/json' -d '{
+# 推荐：显式携带幂等键；超时/背压后用同一个 requestId 原样重发
+curl -s -XPOST localhost:8080/rules/changes \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: 8f1c2e7a' -d '{
   "ruleId":"r","action":"UPSERT",
   "rule":{"id":"r","scope":"TAGS","service":"svc","metric":"m",
           "tagSelector":{},"threshold":100.0,"operator":"GT"}}'
 # 免打扰到事件时间 1727000100000
 curl -s -XPOST localhost:8080/rules/changes -H 'Content-Type: application/json' -d '{
-  "ruleId":"r","action":"MUTE","muteUntilMillis":1727000100000}'
+  "requestId":"mute-2026-04-01","ruleId":"r","action":"MUTE","muteUntilMillis":1727000100000}'
 ```
 
 ---
@@ -236,7 +304,8 @@ curl -s -XPOST localhost:8080/rules/changes -H 'Content-Type: application/json' 
 （`EventProcessor`），在独立的状态副本上重建：
 
 * 边界内已定稿的窗口聚合（`end <= 复盘水位线`）；
-* 每个窗口当时生效的规则版本（按生效边界解析）与对应告警状态（含 `ruleVersion`、`muted`）；
+* 每个窗口当时生效的规则版本（按生效边界解析）与对应告警状态（含 `ruleVersion`、`muted`
+  及与实时逐位一致的完整判定依据链 `evidence`）；
 * 调用链拓扑结论（COMPLETE/ORPHAN/CYCLE/DUPLICATE_SPAN 及判定依据）；
 * 边界内被确定拒绝的事件按原因计数（审计依据）。
 
@@ -272,8 +341,10 @@ mvn clean test
 ```
 
 测试均关闭空闲水位线推进（`advance-on-idle=false`），用水位线只随事件时间前进的方式
-保证确定性；每个用例的日志都会打印**输入事件**与**判定依据**（INGEST / ASSERT /
-AGGREGATE / ALERT / STATE 行）。
+保证确定性；每个用例的日志都会打印**输入事件**、**用到的规则版本**与**每一步的判定依据**
+（INGEST / ASSERT / AGGREGATE / ALERT / STATE 行，以及 `BASIS` / `REPLAY_BASIS`
+逐条判定依据：窗口、均值、阈值版本、streak、翻转/冷却抑制/免打扰原因；
+规则变更打印 `RULE_CHANGE requestId=… replayed=… version=… effectiveFrom=…`）。
 
 | 测试类 | 覆盖场景 |
 | --- | --- |
@@ -286,17 +357,21 @@ AGGREGATE / ALERT / STATE 行）。
 | `EndToEndIntegrationTest` | 经 HTTP 的摄取→聚合→告警→链路→指标全链路对齐；重复 / 迟到的 HTTP 语义 |
 | `RuleHotUpdateTest` | 阈值在线调整的生效边界（边界前维持原判、边界后新规则）、启停续接、非法变更拒绝 |
 | `MuteRecoveryTest` | 免打扰抑制判定、结束后平稳恢复不补发、UNMUTE 立即恢复 |
+| `RuleChangeIdempotencyTest` | 同 requestId 顺序/并发重试只落一个版本且返回一致；生效后重试不重新定稿、不改判定；变更与并发摄取交错版本连续；背压（确定未生效）与超时（结论不确定）的可区分语义及同键重试收敛；同键不同载荷/非法变更拒绝且零副作用 |
+| `AlertEvidenceTest` | 判定依据完整性：OK→PENDING→FIRING 每步窗口/聚合/版本/阈值/计数可读；免打扰窗口标记 muted 且不累计；边界前后版本切换；实时=复盘、重复复盘依据逐位一致；每条告警带非空 rationale |
+| `RealtimeReplayAlignmentTest` | 多规则多对象 + 变更 + 免打扰下，同一时间边界实时与复盘的每条告警（状态/版本/计数/完整依据）逐条对得上；定稿聚合一并对齐 |
 | `RuleChangeConcurrencyTest` | 8 线程并发摄取 + 20 次并发规则变更：计数守恒、版本连续、实时/复盘三视图逐位一致 |
 | `ReplayDeterminismTest` | 重复复盘逐位一致、与当时实时结论对齐、不改写实时状态、日志/规则历史超范围明确拒绝 |
 | `CrossViewConsistencyTest` | 同一事件/窗口/链路在聚合、链路、告警、复盘视图中的计入/排除与异常标记一致 |
-| `RuleReplayHttpTest` | HTTP 层规则变更、版本历史、复盘与 422 错误语义 |
+| `RuleReplayHttpTest` | HTTP 层规则变更、版本历史、复盘与 422 错误语义；requestId / Idempotency-Key 幂等（replayed 标志、同键冲突 422）；告警/复盘的 evidence 字段 |
 
-查看某次测试的输入与判定：
+查看某次测试的输入、规则版本与每步判定依据：
 
 ```bash
-mvn test -Dtest=AlertStabilityTest
+mvn test -Dtest=AlertEvidenceTest
 # 输出示例：
-# INGEST eventId=... eventTime=... value=20.0 => ACCEPTED
-# ALERT rule=high state=FIRING breachStreak=2 ...
-# ASSERT w@80=5 => FIRING（瞬时回落不恢复）
+# RULE_CHANGE requestId=up-1 replayed=false version=1 rule=r action=UPSERT effectiveFrom=11 ...
+# BASIS rule=r subject={} v1 window=[20,30) avg=20.0/n=1 GT 100.0 => FIRING->OK muted=false ...
+#   | 窗口[20,30) avg=20.0 未越界（GT 阈值 100.0…）；连续恢复 1/1 且冷却已满 => FIRING 恢复为 OK
+# REPLAY_BASIS rule=r ...（与实时同一步逐位相同）
 ```

@@ -120,9 +120,13 @@ public class TelemetryProperties {
     public static class Rules {
         /** 保留的规则变更版本数上限；超出后最老版本折叠进基线，更早边界不可复盘。 */
         private int maxVersions = 1_000;
+        /** 规则变更幂等键登记表上限；超出淘汰最老键（&lt;=0 表示取 maxVersions*2）。 */
+        private int maxIdempotencyKeys = 2_000;
 
         public int getMaxVersions() { return maxVersions; }
         public void setMaxVersions(int maxVersions) { this.maxVersions = maxVersions; }
+        public int getMaxIdempotencyKeys() { return maxIdempotencyKeys; }
+        public void setMaxIdempotencyKeys(int maxIdempotencyKeys) { this.maxIdempotencyKeys = maxIdempotencyKeys; }
     }
 
     /** 复盘事件日志参数。 */
@@ -155,6 +159,8 @@ public class TelemetryProperties {
         private int recoverStreak = 2;
         /** FIRING 后再次允许状态翻转的最短间隔。 */
         private Duration cooldown = Duration.ofSeconds(30);
+        /** 每个“规则 × 对象”保留的最近判定依据（AlertEvidence）条数上限。 */
+        private int evidenceTrailSize = 64;
 
         public int getBreachStreak() { return breachStreak; }
         public void setBreachStreak(int breachStreak) { this.breachStreak = breachStreak; }
@@ -162,5 +168,7 @@ public class TelemetryProperties {
         public void setRecoverStreak(int recoverStreak) { this.recoverStreak = recoverStreak; }
         public Duration getCooldown() { return cooldown; }
         public void setCooldown(Duration cooldown) { this.cooldown = cooldown; }
+        public int getEvidenceTrailSize() { return evidenceTrailSize; }
+        public void setEvidenceTrailSize(int evidenceTrailSize) { this.evidenceTrailSize = evidenceTrailSize; }
     }
 }
