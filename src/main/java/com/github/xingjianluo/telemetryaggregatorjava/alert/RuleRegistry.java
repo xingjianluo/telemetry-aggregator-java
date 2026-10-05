@@ -36,6 +36,13 @@ public class RuleRegistry {
     private final List<RuleChange> history = new ArrayList<>();
     private long nextVersion = 1L;
     private Long oldestEvictedEffectiveFrom;
+    /**
+     * 幂等登记：requestId -> (原始请求, 已落版本)。同一 requestId 的重试直接复用
+     * 已登记的变更记录，不再产生新版本；与历史一并受 maxVersions 保留约束，
+     * 变更被折叠进基线时其幂等登记同步淘汰（与复盘保留范围一致）。
+     */
+    private final Map<String, RuleChangeRequest> idempotentRequests = new LinkedHashMap<>();
+    private final Map<String, RuleChange> idempotentChanges = new LinkedHashMap<>();
 
     public RuleRegistry(List<AlertRule> initialRules, int maxVersions) {
         this.maxVersions = Math.max(1, maxVersions);
@@ -49,9 +56,25 @@ public class RuleRegistry {
     /**
      * 应用一次变更。必须由与摄取同一线性化点调用（worker 线程），
      * 调用前需保证 end <= effectiveFromMillis 的窗口均已定稿。
+     *
+     * <p>幂等：请求携带 {@code requestId} 时，若该键已登记，直接返回首次登记的
+     * 变更记录（同一版本号、同一生效边界），不重复校验、不产生新版本、不改变
+     * 规则状态；键相同但载荷不同视为冲突，快速拒绝且不产生版本。
      */
     public synchronized RuleChange applyChange(RuleChangeRequest request,
                                                long effectiveFromMillis, long nowMillis) {
+        if (request != null && request.requestId() != null && !request.requestId().isBlank()) {
+            RuleChange existing = idempotentChanges.get(request.requestId());
+            if (existing != null) {
+                RuleChangeRequest original = idempotentRequests.get(request.requestId());
+                if (original != null && !original.samePayloadAs(request)) {
+                    throw new IllegalArgumentException(
+                            "requestId=" + request.requestId() + " 已登记为另一份载荷"
+                                    + "（版本 " + existing.version() + "），相同幂等键不得复用于不同变更");
+                }
+                return existing;
+            }
+        }
         validate(request);
         String ruleId = request.ruleId();
         MutableRule before = current.get(ruleId);
@@ -71,10 +94,22 @@ public class RuleRegistry {
         }
         current.put(ruleId, after);
         RuleChange change = new RuleChange(version, ruleId, request.action(),
-                after.rule(), muteUntil, effectiveFromMillis, nowMillis);
+                after.rule(), muteUntil, effectiveFromMillis, nowMillis, request.requestId());
         history.add(change);
+        if (request.requestId() != null && !request.requestId().isBlank()) {
+            idempotentRequests.put(request.requestId(), request);
+            idempotentChanges.put(request.requestId(), change);
+        }
         enforceHistoryBound();
         return change;
+    }
+
+    /**
+     * 仅校验不应用（供提交方在入队前快速失败）。权威校验仍在
+     * {@link #applyChange} 内、与事件处理同一线性化点重新执行。
+     */
+    public synchronized void validateChange(RuleChangeRequest request) {
+        validate(request);
     }
 
     private void validate(RuleChangeRequest request) {
@@ -167,13 +202,17 @@ public class RuleRegistry {
         }
     }
 
-    /** 版本数超限时，把最老变更折叠进基线并记录可复盘下界。 */
+    /** 版本数超限时，把最老变更折叠进基线并记录可复盘下界；幂等登记随之一并淘汰。 */
     private void enforceHistoryBound() {
         while (history.size() > maxVersions) {
             RuleChange evicted = history.remove(0);
             applyTo(baseline, evicted);
             baselineEffectiveFrom = Math.max(baselineEffectiveFrom, evicted.effectiveFromMillis());
             oldestEvictedEffectiveFrom = baselineEffectiveFrom;
+            if (evicted.requestId() != null) {
+                idempotentRequests.remove(evicted.requestId());
+                idempotentChanges.remove(evicted.requestId());
+            }
         }
     }
 

@@ -52,6 +52,37 @@ public class IngestionEngine {
         }
     }
 
+    /**
+     * 非法变更（载荷缺字段、未知规则、幂等键冲突等）：永久性失败，
+     * 未产生任何版本、不影响已有规则状态；修正载荷后才可能成功。
+     */
+    public static class RuleChangeInvalidException extends RuleChangeException {
+        public RuleChangeInvalidException(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
+
+    /**
+     * 背压拒绝：变更<b>确定没有生效</b>（未进入处理队列），
+     * 稍后以相同请求（相同 requestId）重试即可得到确定结论。
+     */
+    public static class RuleChangeBackpressureException extends RuleChangeException {
+        public RuleChangeBackpressureException(String message) {
+            super(message);
+        }
+    }
+
+    /**
+     * 等待回执超时：变更<b>可能已生效、也可能未生效</b>，调用方不得假定任何一侧。
+     * 以相同 requestId 重试是安全的：若首次已生效，重试返回首次登记的同一版本与
+     * 同一生效边界；若未生效，重试正常落一个版本。两种情况都不会产生第二个版本。
+     */
+    public static class RuleChangeTimeoutException extends RuleChangeException {
+        public RuleChangeTimeoutException(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
+
     private final TelemetryProperties props;
     private final EventProcessor processor;
     private final IngestionMetrics metrics;
@@ -111,22 +142,49 @@ public class IngestionEngine {
 
     /**
      * 在线提交规则变更：与事件写入共用同一队列，按到达顺序在 worker 线程内应用。
-     * 返回带版本号与生效边界的变更记录；校验失败 / 背压 / 超时以
-     * {@link RuleChangeException} 快速失败，绝不长时间阻塞调用方。
+     * 返回带版本号与生效边界的变更记录。
+     *
+     * <p>失败语义可区分（均为快速失败，绝不长时间阻塞调用方）：
+     * <ul>
+     *   <li>{@link RuleChangeInvalidException}：非法变更，未产生版本，重试原样载荷必然再次失败；</li>
+     *   <li>{@link RuleChangeBackpressureException}：确定未生效，可安全重试；</li>
+     *   <li>{@link RuleChangeTimeoutException}：结果未知，以相同 requestId 重试可收敛到唯一版本。</li>
+     * </ul>
+     * 请求携带 {@code requestId} 时，任意次重试最多落一个版本，且每次成功返回
+     * 同一版本号与同一生效边界。
      */
     public RuleChange submitRuleChange(RuleChangeRequest request) {
+        // 入队前快速校验（确定性失败立即返回，不占队列）；权威校验仍在 worker 内重做。
+        try {
+            processor.validateRuleChange(request);
+        } catch (IllegalArgumentException e) {
+            throw new RuleChangeInvalidException("非法规则变更（未产生版本）: " + e.getMessage(), e);
+        }
         ChangeTask task = new ChangeTask(request, new CompletableFuture<>());
         if (!offer(task)) {
-            throw new RuleChangeException("摄取缓冲已满，规则变更被背压拒绝，可稍后重试");
+            throw new RuleChangeBackpressureException(
+                    "摄取缓冲已满，规则变更未生效（确定未应用），可稍后以相同 requestId 重试");
         }
         try {
             return task.future().get(props.getBuffer().getResultTimeout().toMillis(),
                     TimeUnit.MILLISECONDS);
+        } catch (java.util.concurrent.TimeoutException e) {
+            throw new RuleChangeTimeoutException(
+                    "等待规则变更回执超时，变更可能已生效也可能未生效；"
+                            + "请以相同 requestId 重试，幂等登记保证最多落一个版本"
+                            + (request.requestId() == null ? "（本请求未携带 requestId，重试可能产生新版本）" : ""),
+                    e);
         } catch (java.util.concurrent.ExecutionException e) {
             Throwable cause = e.getCause() == null ? e : e.getCause();
+            if (cause instanceof IllegalArgumentException) {
+                throw new RuleChangeInvalidException(
+                        "非法规则变更（未产生版本）: " + cause.getMessage(), cause);
+            }
             throw new RuleChangeException(cause.getMessage(), cause);
-        } catch (Exception e) {
-            throw new RuleChangeException("等待规则变更结果超时或中断: " + e.getMessage(), e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuleChangeTimeoutException(
+                    "等待规则变更回执被中断，变更可能已生效也可能未生效；请以相同 requestId 重试", e);
         }
     }
 

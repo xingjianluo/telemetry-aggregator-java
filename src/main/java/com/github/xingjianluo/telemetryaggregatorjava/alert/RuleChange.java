@@ -19,7 +19,9 @@ public record RuleChange(
         /** 生效边界（事件时间水位线）。 */
         long effectiveFromMillis,
         /** 墙上时钟应用时间（仅用于展示，不参与判定，保证复盘确定性）。 */
-        long appliedAtMillis
+        long appliedAtMillis,
+        /** 幂等键（调用方提供）；相同 requestId 的重试复用本记录，不产生新版本。 */
+        String requestId
 ) {
     /** 变更动作类型。 */
     public enum Action {

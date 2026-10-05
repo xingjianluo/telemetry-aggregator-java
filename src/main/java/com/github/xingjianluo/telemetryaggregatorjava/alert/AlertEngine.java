@@ -48,6 +48,8 @@ public class AlertEngine {
         Map<String, String> tags = Map.of();
         String traceMarker;
         AlertRule.Scope scope = AlertRule.Scope.TAGS;
+        /** 最近一次判定的可读依据（只含事件时间与规则版本，复盘逐位复现）。 */
+        String decisionBasis = "尚未评估任何定稿窗口";
     }
 
     private record SubjectKey(String ruleId, String subject) {
@@ -136,24 +138,37 @@ public class AlertEngine {
             subject.traceMarker = traceMarker;
         }
 
+        AlertRule rule = resolved.rule();
+        boolean breach = rule.breaches(value);
+        // 判定依据的公共证据部分：窗口区间、窗口均值、阈值比较结果（全部来自事件时间）。
+        String evidence = "窗口[" + windowStartMillis + "," + windowEndMillis + ") avg=" + value
+                + (breach ? " 命中阈值 " : " 未命中阈值 ")
+                + rule.operator() + " " + rule.threshold();
+        String ruleRef = "（规则版本 " + resolved.version() + "）";
+
         // 免打扰：窗口 end 落在免打扰区间内 -> 只记录证据，不推进状态机；
         // streak 清零，免打扰结束后需按当前证据重新累计确认，平稳恢复、不补发。
         if (resolved.muteUntilMillis() > 0 && windowEndMillis <= resolved.muteUntilMillis()) {
             subject.muted = true;
             subject.consecutiveBreaches = 0;
             subject.consecutiveRecoveries = 0;
+            subject.decisionBasis = evidence + "；窗口 end=" + windowEndMillis
+                    + " 处于免打扰区间（end<=muteUntil=" + resolved.muteUntilMillis()
+                    + "），判定被抑制：仅记录证据，streak 清零不累计，状态维持 " + subject.state + ruleRef;
             return;
         }
         subject.muted = false;
 
-        boolean breach = resolved.rule().breaches(value);
         // 状态机时间基准 = 定稿窗口 end（事件时间），与墙上时钟无关，保证复盘可复现。
         long now = windowEndMillis;
+        AlertState before = subject.state;
 
         if (subject.state == AlertState.FIRING) {
             if (breach) {
                 subject.consecutiveBreaches++;
                 subject.consecutiveRecoveries = 0;
+                subject.decisionBasis = evidence + "；已处于 FIRING，越界持续（连续越界 "
+                        + subject.consecutiveBreaches + " 个窗口），状态维持 FIRING" + ruleRef;
             } else {
                 subject.consecutiveRecoveries++;
                 subject.consecutiveBreaches = 0;
@@ -161,6 +176,18 @@ public class AlertEngine {
                         && now - subject.lastChangedMillis >= cooldownMillis) {
                     subject.state = AlertState.OK;
                     subject.lastChangedMillis = now;
+                    subject.decisionBasis = evidence + "；连续恢复 "
+                            + subject.consecutiveRecoveries + "/" + recoverStreak
+                            + " 个窗口且已过冷却期，状态 FIRING->OK" + ruleRef;
+                } else if (subject.consecutiveRecoveries >= recoverStreak) {
+                    subject.decisionBasis = evidence + "；连续恢复 "
+                            + subject.consecutiveRecoveries + "/" + recoverStreak
+                            + " 个窗口，但距上次翻转 " + (now - subject.lastChangedMillis)
+                            + "ms 未过冷却期 " + cooldownMillis + "ms，状态维持 FIRING" + ruleRef;
+                } else {
+                    subject.decisionBasis = evidence + "；连续恢复 "
+                            + subject.consecutiveRecoveries + "/" + recoverStreak
+                            + " 个窗口，确认次数不足，状态维持 FIRING" + ruleRef;
                 }
             }
             return;
@@ -172,15 +199,27 @@ public class AlertEngine {
             subject.consecutiveRecoveries = 0;
             if (subject.consecutiveBreaches < breachStreak) {
                 subject.state = AlertState.PENDING;
+                subject.decisionBasis = evidence + "；连续越界 " + subject.consecutiveBreaches
+                        + "/" + breachStreak + " 个窗口，确认次数不足，状态 " + before
+                        + "->PENDING（暂不对外报警）" + ruleRef;
             } else if (subject.lastChangedMillis < 0
                     || now - subject.lastChangedMillis >= cooldownMillis) {
                 subject.state = AlertState.FIRING;
                 subject.lastChangedMillis = now;
+                subject.decisionBasis = evidence + "；连续越界 " + subject.consecutiveBreaches
+                        + "/" + breachStreak + " 个窗口，达到确认条件，状态 " + before
+                        + "->FIRING" + ruleRef;
+            } else {
+                subject.decisionBasis = evidence + "；连续越界 " + subject.consecutiveBreaches
+                        + "/" + breachStreak + " 个窗口，但距上次翻转 "
+                        + (now - subject.lastChangedMillis) + "ms 未过冷却期 " + cooldownMillis
+                        + "ms，状态维持 " + before + ruleRef;
             }
         } else {
             subject.consecutiveBreaches = 0;
             subject.consecutiveRecoveries = 0;
             subject.state = AlertState.OK;
+            subject.decisionBasis = evidence + "；streak 清零，状态 " + before + "->OK" + ruleRef;
         }
     }
 
@@ -191,7 +230,8 @@ public class AlertEngine {
                         key.ruleId(), s.scope, key.subject(),
                         Map.copyOf(s.tags), s.state, s.consecutiveBreaches,
                         s.consecutiveRecoveries, s.lastValue, s.lastWindowStart,
-                        s.lastChangedMillis, s.traceMarker, s.ruleVersion, s.muted)));
+                        s.lastChangedMillis, s.traceMarker, s.ruleVersion, s.muted,
+                        s.decisionBasis)));
         return out;
     }
 }

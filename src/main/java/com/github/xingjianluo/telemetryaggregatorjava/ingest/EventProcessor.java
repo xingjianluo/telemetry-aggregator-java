@@ -203,11 +203,17 @@ public class EventProcessor {
      * 应用规则变更（与事件处理同一线性化点）：
      * 先把所有可定稿窗口按当前（旧）规则定稿，再以当前水位线为生效边界登记变更。
      * 因此 end <= 边界的窗口永远维持原判，end > 边界的窗口按新规则判定。
+     * 携带 requestId 的请求重复到达时直接返回首次登记的变更记录，不产生新版本。
      */
     public RuleChange applyRuleChange(RuleChangeRequest request) {
         sealWindowsAndEvaluate();
         return ruleRegistry.applyChange(request, watermark.currentWatermark(),
                 System.currentTimeMillis());
+    }
+
+    /** 入队前的快速校验（权威校验仍在 worker 线程内重做）。 */
+    public void validateRuleChange(RuleChangeRequest request) {
+        ruleRegistry.validateChange(request);
     }
 
     /** 周期推进：空闲水位线推进 + 定稿 + 调用链回收。 */

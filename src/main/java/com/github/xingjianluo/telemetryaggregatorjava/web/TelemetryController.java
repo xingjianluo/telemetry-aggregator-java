@@ -86,12 +86,38 @@ public class TelemetryController {
     /**
      * 在线变更告警规则（无需重启、不断流）。变更与事件写入在同一线性化点应用：
      * 先生效边界之前的已定稿窗口维持原判，之后按新规则判定。
+     *
+     * <p>幂等：请求携带 {@code requestId} 时，任意次重试最多落一个版本，
+     * 且每次成功返回同一版本号与同一生效边界。
+     *
+     * <p>失败语义可区分：422=非法变更（未产生版本，原样重试必然再失败）；
+     * 503=背压（确定未生效，可安全重试）；504=等待回执超时（结果未知，
+     * 以相同 requestId 重试收敛到唯一版本）。
      */
     @PostMapping("/rules/changes")
     public ResponseEntity<?> changeRule(@RequestBody RuleChangeRequest request) {
         try {
             RuleChange change = engine.submitRuleChange(request);
             return ResponseEntity.ok(change);
+        } catch (IngestionEngine.RuleChangeInvalidException e) {
+            return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)
+                    .body(Map.of("error", "RULE_CHANGE_INVALID",
+                            "applied", false,
+                            "retryable", false,
+                            "detail", String.valueOf(e.getMessage())));
+        } catch (IngestionEngine.RuleChangeBackpressureException e) {
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                    .body(Map.of("error", "RULE_CHANGE_NOT_APPLIED",
+                            "applied", false,
+                            "retryable", true,
+                            "detail", String.valueOf(e.getMessage())));
+        } catch (IngestionEngine.RuleChangeTimeoutException e) {
+            return ResponseEntity.status(HttpStatus.GATEWAY_TIMEOUT)
+                    .body(Map.of("error", "RULE_CHANGE_OUTCOME_UNKNOWN",
+                            "applied", "unknown",
+                            "retryable", true,
+                            "retryHint", "以相同 requestId 重试：已生效则返回首次版本，未生效则正常落一个版本",
+                            "detail", String.valueOf(e.getMessage())));
         } catch (IngestionEngine.RuleChangeException e) {
             return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)
                     .body(Map.of("error", "RULE_CHANGE_REJECTED",

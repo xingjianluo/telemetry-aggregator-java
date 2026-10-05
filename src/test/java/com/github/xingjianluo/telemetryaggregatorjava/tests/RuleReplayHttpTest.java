@@ -101,11 +101,64 @@ class RuleReplayHttpTest {
                 .andExpect(jsonPath("$.ruleChanges[0].version").value(1));
         log.info("[ASSERT] HTTP 规则变更 / 历史 / 复盘全部符合预期");
 
-        // 非法变更：422 + 可区分错误
+        // 非法变更：422 + 可区分错误（永久性失败，未产生版本）
         String bad = json.writeValueAsString(Map.of(
                 "ruleId", "ghost", "action", "DISABLE"));
         mvc.perform(post("/rules/changes").contentType(MediaType.APPLICATION_JSON).content(bad))
                 .andExpect(status().isUnprocessableEntity())
-                .andExpect(jsonPath("$.error").value("RULE_CHANGE_REJECTED"));
+                .andExpect(jsonPath("$.error").value("RULE_CHANGE_INVALID"))
+                .andExpect(jsonPath("$.applied").value(false))
+                .andExpect(jsonPath("$.retryable").value(false));
+    }
+
+    @Test
+    void idempotentRetryAndDecisionBasisOverHttp() throws Exception {
+        log.info("[CASE] HTTP：携带 requestId 的变更重试只落一个版本；告警与复盘结论带判定依据");
+        mvc.perform(post("/events").contentType(MediaType.APPLICATION_JSON).content(event("e1", 1, 20)))
+                .andExpect(status().isAccepted());
+        mvc.perform(post("/events").contentType(MediaType.APPLICATION_JSON).content(event("s1", 11, 0)))
+                .andExpect(status().isAccepted());
+
+        // 实时告警结论带可读判定依据
+        mvc.perform(get("/alerts"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$[0].state").value("FIRING"))
+                .andExpect(jsonPath("$[0].decisionBasis").isNotEmpty());
+
+        // 同一变更请求（相同 requestId）重复提交：版本号与生效边界完全一致
+        String change = json.writeValueAsString(Map.of(
+                "ruleId", "r", "action", "UPSERT", "requestId", "http-req-1",
+                "rule", Map.of("id", "r", "scope", "TAGS", "service", "svc", "metric", "m",
+                        "tagSelector", Map.of(), "threshold", 100.0, "operator", "GT")));
+        for (int i = 0; i < 3; i++) {
+            mvc.perform(post("/rules/changes").contentType(MediaType.APPLICATION_JSON).content(change))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.version").value(1))
+                    .andExpect(jsonPath("$.effectiveFromMillis").value(11))
+                    .andExpect(jsonPath("$.requestId").value("http-req-1"));
+        }
+        // 历史只有一条：重试没有产生新版本
+        mvc.perform(get("/rules/history"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.length()").value(1))
+                .andExpect(jsonPath("$[0].requestId").value("http-req-1"));
+
+        // 相同 requestId + 不同载荷：422 冲突，不产生版本
+        String conflict = json.writeValueAsString(Map.of(
+                "ruleId", "r", "action", "UPSERT", "requestId", "http-req-1",
+                "rule", Map.of("id", "r", "scope", "TAGS", "service", "svc", "metric", "m",
+                        "tagSelector", Map.of(), "threshold", 200.0, "operator", "GT")));
+        mvc.perform(post("/rules/changes").contentType(MediaType.APPLICATION_JSON).content(conflict))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error").value("RULE_CHANGE_INVALID"));
+        mvc.perform(get("/rules/history"))
+                .andExpect(jsonPath("$.length()").value(1));
+
+        // 复盘结论同样带判定依据，且与实时一致
+        mvc.perform(get("/replay").param("asOfMillis", "11"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.alerts[0].state").value("FIRING"))
+                .andExpect(jsonPath("$.alerts[0].decisionBasis").isNotEmpty());
+        log.info("[ASSERT] HTTP 幂等重试 / 冲突拒绝 / 判定依据字段全部符合预期");
     }
 }

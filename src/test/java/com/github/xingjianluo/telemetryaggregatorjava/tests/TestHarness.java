@@ -94,8 +94,8 @@ final class TestHarness {
 
         RuleChange change(Logger log, RuleChangeRequest req) {
             RuleChange c = engine.submitRuleChange(req);
-            log.info("RULE_CHANGE version={} rule={} action={} effectiveFrom={} muteUntil={} snapshot={}",
-                    c.version(), c.ruleId(), c.action(), c.effectiveFromMillis(),
+            log.info("RULE_CHANGE requestId={} => version={} rule={} action={} effectiveFrom={} muteUntil={} snapshot={}",
+                    req.requestId(), c.version(), c.ruleId(), c.action(), c.effectiveFromMillis(),
                     c.muteUntilMillis(), c.ruleSnapshot());
             return c;
         }
@@ -106,8 +106,9 @@ final class TestHarness {
                     asOfMillis, r.status(), r.replayWatermarkMillis(), r.acceptedCount(),
                     r.sealedWindowCount(), r.detail());
             r.alerts().forEach(a -> log.info(
-                    "REPLAY_ALERT rule={} subject={} state={} ruleVersion={} muted={} value={}",
-                    a.ruleId(), a.subjectKey(), a.state(), a.ruleVersion(), a.muted(), a.lastValue()));
+                    "REPLAY_ALERT rule={} subject={} state={} ruleVersion={} muted={} value={} basis={}",
+                    a.ruleId(), a.subjectKey(), a.state(), a.ruleVersion(), a.muted(), a.lastValue(),
+                    a.decisionBasis()));
             return r;
         }
 
@@ -123,10 +124,11 @@ final class TestHarness {
                     a.windowStartMillis(), a.windowEndMillis(), a.service(), a.metric(),
                     a.tags(), a.count(), a.sum(), a.min(), a.max(), a.avg()));
             alertEngine.snapshots().forEach(s -> log.info(
-                    "ALERT rule={} scope={} subject={} state={} breachStreak={} recoverStreak={} value={} window={} marker={}",
+                    "ALERT rule={} scope={} subject={} state={} breachStreak={} recoverStreak={} value={} window={} ruleVersion={} muted={} marker={} basis={}",
                     s.ruleId(), s.scope(), s.subjectKey(), s.state(),
                     s.consecutiveBreaches(), s.consecutiveRecoveries(),
-                    s.lastValue(), s.lastEvaluatedWindowStart(), s.traceMarker()));
+                    s.lastValue(), s.lastEvaluatedWindowStart(), s.ruleVersion(), s.muted(),
+                    s.traceMarker(), s.decisionBasis()));
         }
 
         @Override
